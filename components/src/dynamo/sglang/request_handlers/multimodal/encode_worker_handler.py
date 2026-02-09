@@ -169,7 +169,10 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
                 zip(multimodal_groups, image_grid_thw_list, precomputed_embeddings_list)
             ):
                 mm_group.image_grid_thw = image_grid_thw
-                embeddings = embeddings.unsqueeze(0) if embeddings.ndim == 2 else embeddings
+                embeddings = (
+                    embeddings.unsqueeze(0) if embeddings.ndim == 2 else embeddings
+                )
+                precomputed_embeddings_list[idx] = embeddings
                 mm_group.embeddings_shape = tuple(embeddings.shape)
                 embeddings_shape_list.append(mm_group.embeddings_shape)
                 mm_group.multimodal_input.image_url = None
@@ -216,8 +219,8 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
                     await readable.wait_for_completion()
 
                 async for response in response_generator:
-                    yield response.data() if hasattr(response, "data") else str(
-                        response
+                    yield (
+                        response.data() if hasattr(response, "data") else str(response)
                     )
 
         except Exception as e:

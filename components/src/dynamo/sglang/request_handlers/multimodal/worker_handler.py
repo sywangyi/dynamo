@@ -120,9 +120,7 @@ class EmbeddingsProcessor:
             if descriptor is None:
                 raise RuntimeError("Descriptor is None - cannot process embeddings")
 
-            read_op = await self._connector.begin_read(
-                serialized_request, descriptor
-            )
+            read_op = await self._connector.begin_read(serialized_request, descriptor)
             await read_op.wait_for_completion()
 
             embeddings_list.append(embeddings)
@@ -149,9 +147,7 @@ class EmbeddingsProcessor:
         return torch.cat(normalized, dim=0)
 
     @staticmethod
-    def create_multimodal_item(
-        embeddings: torch.Tensor, image_grid_thw
-    ) -> dict:
+    def create_multimodal_item(embeddings: torch.Tensor, image_grid_thw) -> dict:
         """
         Create multimodal item for SGLang generation.
 
@@ -327,7 +323,11 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
         for group in multimodal_inputs:
             embeddings_shape = group.get("embeddings_shape")
             if isinstance(embeddings_shape, list) and len(embeddings_shape) == 2:
-                group["embeddings_shape"] = [1, embeddings_shape[0], embeddings_shape[1]]
+                group["embeddings_shape"] = [
+                    1,
+                    embeddings_shape[0],
+                    embeddings_shape[1],
+                ]
         return request_payload
 
     async def generate(
@@ -570,9 +570,7 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
         sampling_params = disagg_request.sampling_params
 
         # Process embeddings from encode worker using our embeddings processor
-        embeddings_list, _ = await self.embeddings_processor.process_embeddings(
-            request
-        )
+        embeddings_list, _ = await self.embeddings_processor.process_embeddings(request)
 
         image_grid_thw_list = [
             group.image_grid_thw for group in request.multimodal_inputs

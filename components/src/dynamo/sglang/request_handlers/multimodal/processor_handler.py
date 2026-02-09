@@ -69,7 +69,6 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
 
         image_urls: list[str] = []
         video_url: str | None = None
-
         for message in raw_request.messages:
             for item in message.content:
                 if item.type == "image_url":
@@ -79,13 +78,12 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                 elif item.type == "video_url":
                     if image_urls:
                         raise ValueError("Cannot provide both image and video URLs")
+                    if video_url is not None:
+                        raise ValueError("Multiple video URLs are not supported")
                     video_url = item.video_url.url
-
         if not image_urls and video_url is None:
             raise ValueError("Either image URL or video URL is required")
-
         multimodal_groups: list[MultiModalGroup] = []
-
         if image_urls:
             multimodal_groups = [
                 MultiModalGroup(multimodal_input=MultiModalInput(image_url=url))
