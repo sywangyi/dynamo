@@ -58,12 +58,22 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
         self.image_processor = AutoImageProcessor.from_pretrained(
             self.model, trust_remote_code=True
         )
+        attn_impl = config.dynamo_args.encode_attn_implementation
+        if attn_impl is not None and attn_impl not in (
+            "flash_attention_2",
+            "sdpa",
+            "eager",
+        ):
+            raise ValueError(
+                "encode_attn_implementation must be one of: "
+                "flash_attention_2, sdpa, eager"
+            )
         self.vision_model = AutoModel.from_pretrained(
             self.model,
             device_map="auto",
             torch_dtype=torch.float16,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_impl,
         )
 
         # Load tokenizer to convert image token string to integer ID

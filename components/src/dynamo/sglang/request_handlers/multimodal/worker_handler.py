@@ -107,7 +107,7 @@ class EmbeddingsProcessor:
                 raise ValueError("serialized_request is required")
             if embeddings_shape is None:
                 raise ValueError("embeddings_shape is required")
-            if embeddings_shape is None or len(embeddings_shape) < 2:
+            if len(embeddings_shape) < 2:
                 raise ValueError(f"Invalid embeddings shape: {embeddings_shape}")
 
             embeddings = torch.empty(
@@ -270,6 +270,28 @@ class ErrorResponseBuilder:
         return json.dumps(response)
 
 
+async def _build_mm_items(
+    request: SglangMultimodalRequest, embeddings_processor: EmbeddingsProcessor
+) -> tuple[list[dict], torch.Tensor]:
+    """Process embeddings and build a single multimodal item for SGLang."""
+    embeddings_list, _ = await embeddings_processor.process_embeddings(request)
+
+    image_grid_thw_list = [group.image_grid_thw for group in request.multimodal_inputs]
+    if any(item is None for item in image_grid_thw_list):
+        raise ValueError("image_grid_thw is required")
+    if len(embeddings_list) != len(image_grid_thw_list):
+        raise ValueError("image_grid_thw and embeddings count mismatch")
+
+    combined_embeddings = embeddings_processor.concat_embeddings(embeddings_list)
+    mm_items = [
+        embeddings_processor.create_multimodal_item(
+            combined_embeddings, image_grid_thw_list
+        )
+    ]
+
+    return mm_items, combined_embeddings
+
+
 class MultimodalWorkerHandler(BaseWorkerHandler):
     """
     Multimodal worker handler for LLM inference with multimodal data.
@@ -319,6 +341,11 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
         return request
 
     def _normalize_embeddings_shape(self, request_payload: dict) -> dict:
+        """Normalize 2-element embeddings_shape to 3-element by prepending batch dim=1.
+
+        JSON round-trip can strip the leading batch dimension from 3D shapes
+        (e.g., [tokens, hidden] should be [1, tokens, hidden]).
+        """
         multimodal_inputs = request_payload.get("multimodal_inputs", [])
         for group in multimodal_inputs:
             embeddings_shape = group.get("embeddings_shape")
@@ -394,29 +421,9 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
 
         try:
             sampling_params = SglangUtils.build_sampling_params(request)
-            embeddings_list, _ = await self.embeddings_processor.process_embeddings(
-                request
+            mm_items, combined_embeddings = await _build_mm_items(
+                request, self.embeddings_processor
             )
-
-            image_grid_thw_list = [
-                group.image_grid_thw for group in request.multimodal_inputs
-            ]
-
-            if any(item is None for item in image_grid_thw_list):
-                raise ValueError("image_grid_thw is required")
-
-            if len(embeddings_list) != len(image_grid_thw_list):
-                raise ValueError("image_grid_thw and embeddings count mismatch")
-
-            # Create a single multimodal item with batched grid_thw
-            combined_embeddings = self.embeddings_processor.concat_embeddings(
-                embeddings_list
-            )
-            mm_items = [
-                self.embeddings_processor.create_multimodal_item(
-                    combined_embeddings, image_grid_thw_list
-                )
-            ]
             logger.debug(
                 "Generated combined multimodal item with embeddings shape: "
                 f"{combined_embeddings.shape}"
@@ -570,25 +577,7 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
         sampling_params = disagg_request.sampling_params
 
         # Process embeddings from encode worker using our embeddings processor
-        embeddings_list, _ = await self.embeddings_processor.process_embeddings(request)
-
-        image_grid_thw_list = [
-            group.image_grid_thw for group in request.multimodal_inputs
-        ]
-        if any(item is None for item in image_grid_thw_list):
-            raise ValueError("image_grid_thw is required")
-        if len(embeddings_list) != len(image_grid_thw_list):
-            raise ValueError("image_grid_thw and embeddings count mismatch")
-
-        # Create a single multimodal item with batched grid_thw
-        combined_embeddings = self.embeddings_processor.concat_embeddings(
-            embeddings_list
-        )
-        mm_items = [
-            self.embeddings_processor.create_multimodal_item(
-                combined_embeddings, image_grid_thw_list
-            )
-        ]
+        mm_items, _ = await _build_mm_items(request, self.embeddings_processor)
 
         # Start SGLang prefill generation (like regular SGLang)
         results = await self.engine.async_generate(
