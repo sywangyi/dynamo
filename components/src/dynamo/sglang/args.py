@@ -157,6 +157,13 @@ DYNAMO_ARGS: Dict[str, Dict[str, Any]] = {
         "default": None,
         "help": "Override attention implementation for the multimodal encode worker (e.g., flash_attention_2, sdpa, eager).",
     },
+    "encode-device": {
+        "flags": ["--encode-device"],
+        "type": str,
+        "default": "auto",
+        "choices": ["auto", "cpu"],
+        "help": "Device map for the multimodal encode worker (auto or cpu).",
+    },
 }
 
 
@@ -205,6 +212,8 @@ class DynamoArgs:
     image_diffusion_base_url: Optional[str] = None
     # encode worker attention override
     encode_attn_implementation: Optional[str] = None
+    # encode worker device map
+    encode_device: str = "auto"
 
 
 class DisaggregationMode(Enum):
@@ -616,6 +625,7 @@ async def parse_args(args: list[str]) -> Config:
         encode_attn_implementation=getattr(
             parsed_args, "encode_attn_implementation", None
         ),
+        encode_device=getattr(parsed_args, "encode_device", "auto"),
         dump_config_to=parsed_args.dump_config_to,
         enable_local_indexer=str(parsed_args.enable_local_indexer).lower() == "true",
         use_kv_events=use_kv_events,

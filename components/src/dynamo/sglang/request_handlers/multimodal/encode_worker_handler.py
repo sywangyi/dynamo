@@ -70,7 +70,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
             )
         self.vision_model = AutoModel.from_pretrained(
             self.model,
-            device_map="auto",
+            device_map=config.dynamo_args.encode_device,
             torch_dtype=torch.float16,
             trust_remote_code=True,
             attn_implementation=attn_impl,
