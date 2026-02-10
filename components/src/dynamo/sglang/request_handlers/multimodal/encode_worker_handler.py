@@ -50,6 +50,8 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
     ) -> None:
         super().__init__(component, engine=None, config=config)
         self.pd_worker_client = pd_worker_client
+        self._inflight_lock = asyncio.Lock()
+        self._inflight_requests = 0
         self.model = config.server_args.model_path
         self.served_model_name = config.server_args.served_model_name
 
@@ -129,6 +131,8 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
         # 6. Create a descriptor for the embeddings and send to downstream worker.
 
         try:
+            async with self._inflight_lock:
+                self._inflight_requests += 1
             multimodal_groups = request.multimodal_inputs
 
             if not multimodal_groups:
@@ -236,6 +240,18 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler):
         except Exception as e:
             logger.error(f"Error processing request: {e}")
             raise
+        finally:
+            async with self._inflight_lock:
+                self._inflight_requests = max(0, self._inflight_requests - 1)
+
+    async def status(self, request, context: Context) -> AsyncIterator[dict]:
+        async with self._inflight_lock:
+            inflight = self._inflight_requests
+
+        yield {
+            "inflight": inflight,
+            "device": self.config.dynamo_args.encode_device,
+        }
 
     async def async_init(self, runtime: DistributedRuntime):
         logger.info("Startup started.")

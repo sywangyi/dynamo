@@ -16,7 +16,7 @@ from dynamo.common.utils.endpoint_types import parse_endpoint_types
 from dynamo.llm import ModelInput, ModelType
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
-from dynamo.sglang.args import Config, DisaggregationMode, parse_args
+from dynamo.sglang.args import Config, DisaggregationMode, parse_args, parse_endpoint
 from dynamo.sglang.health_check import (
     ImageDiffusionHealthCheckPayload,
     SglangHealthCheckPayload,
@@ -545,20 +545,59 @@ async def init_multimodal_processor(runtime: DistributedRuntime, config: Config)
 
     generate_endpoint = component.endpoint(dynamo_args.endpoint)
 
-    # For processor, we need to connect to the encode worker
-    encode_worker_client = (
-        await runtime.namespace(dynamo_args.namespace)
-        .component("encoder")
-        .endpoint("generate")
-        .client()
+    async def _client_for_endpoint(endpoint: str):
+        namespace, component_name, endpoint_name = parse_endpoint(endpoint)
+        return (
+            await runtime.namespace(namespace)
+            .component(component_name)
+            .endpoint(endpoint_name)
+            .client()
+        )
+
+    def _status_endpoint_for(endpoint: str) -> str:
+        namespace, component_name, _ = parse_endpoint(endpoint)
+        return f"dyn://{namespace}.{component_name}.status"
+
+    primary_endpoint = (
+        dynamo_args.encode_primary_endpoint
+        or f"dyn://{dynamo_args.namespace}.encoder.generate"
     )
+    encode_worker_client = await _client_for_endpoint(primary_endpoint)
+    encode_primary_status_client = await _client_for_endpoint(
+        _status_endpoint_for(primary_endpoint)
+    )
+    encode_fallback_client = None
+    encode_fallback_status_client = None
+    if dynamo_args.encode_fallback_endpoint:
+        encode_fallback_client = await _client_for_endpoint(
+            dynamo_args.encode_fallback_endpoint
+        )
+        encode_fallback_status_client = await _client_for_endpoint(
+            _status_endpoint_for(dynamo_args.encode_fallback_endpoint)
+        )
 
     ready_event = asyncio.Event()
 
-    handler = MultimodalProcessorHandler(component, config, encode_worker_client)
+    handler = MultimodalProcessorHandler(
+        component,
+        config,
+        encode_worker_client,
+        encode_fallback_client,
+        encode_primary_status_client,
+        encode_fallback_status_client,
+    )
 
     logging.info("Waiting for Encoder Worker Instances ...")
-    await encode_worker_client.wait_for_instances()
+    if encode_fallback_client is None:
+        await encode_worker_client.wait_for_instances()
+    else:
+        while True:
+            if (
+                encode_worker_client.instance_ids()
+                or encode_fallback_client.instance_ids()
+            ):
+                break
+            await asyncio.sleep(1)
 
     try:
         await asyncio.gather(
@@ -609,10 +648,18 @@ async def init_multimodal_encode_worker(runtime: DistributedRuntime, config: Con
     try:
         # Encode Worker is an internal component, should not register with Frontend
         # Only needs to provide internal service endpoint for Processor to call
-        await generate_endpoint.serve_endpoint(
-            handler.generate,
-            graceful_shutdown=True,
-            metrics_labels=[("model", server_args.served_model_name)],
+        status_endpoint = component.endpoint("status")
+        await asyncio.gather(
+            generate_endpoint.serve_endpoint(
+                handler.generate,
+                graceful_shutdown=True,
+                metrics_labels=[("model", server_args.served_model_name)],
+            ),
+            status_endpoint.serve_endpoint(
+                handler.status,
+                graceful_shutdown=True,
+                metrics_labels=[("model", server_args.served_model_name)],
+            ),
         )
     except Exception as e:
         logging.error(f"Failed to serve endpoints: {e}")

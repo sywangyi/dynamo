@@ -164,6 +164,30 @@ DYNAMO_ARGS: Dict[str, Dict[str, Any]] = {
         "choices": ["auto", "cpu"],
         "help": "Device map for the multimodal encode worker (auto or cpu).",
     },
+    "encode-primary-endpoint": {
+        "flags": ["--encode-primary-endpoint"],
+        "type": str,
+        "default": None,
+        "help": "Primary encode worker endpoint for the multimodal processor (dyn://namespace.component.endpoint).",
+    },
+    "encode-fallback-endpoint": {
+        "flags": ["--encode-fallback-endpoint"],
+        "type": str,
+        "default": None,
+        "help": "Fallback encode worker endpoint for the multimodal processor (dyn://namespace.component.endpoint).",
+    },
+    "encode-primary-max-inflight": {
+        "flags": ["--encode-primary-max-inflight"],
+        "type": int,
+        "default": 0,
+        "help": "Fallback to secondary when primary inflight requests reaches this value (0 disables).",
+    },
+    "encode-status-timeout-ms": {
+        "flags": ["--encode-status-timeout-ms"],
+        "type": int,
+        "default": 200,
+        "help": "Timeout in ms when querying encode worker status for busy checks.",
+    },
 }
 
 
@@ -214,6 +238,12 @@ class DynamoArgs:
     encode_attn_implementation: Optional[str] = None
     # encode worker device map
     encode_device: str = "auto"
+    # multimodal processor encode endpoints
+    encode_primary_endpoint: Optional[str] = None
+    encode_fallback_endpoint: Optional[str] = None
+    # multimodal processor busy check
+    encode_primary_max_inflight: int = 0
+    encode_status_timeout_ms: int = 200
 
 
 class DisaggregationMode(Enum):
@@ -626,6 +656,18 @@ async def parse_args(args: list[str]) -> Config:
             parsed_args, "encode_attn_implementation", None
         ),
         encode_device=getattr(parsed_args, "encode_device", "auto"),
+        encode_primary_endpoint=getattr(
+            parsed_args, "encode_primary_endpoint", None
+        ),
+        encode_fallback_endpoint=getattr(
+            parsed_args, "encode_fallback_endpoint", None
+        ),
+        encode_primary_max_inflight=getattr(
+            parsed_args, "encode_primary_max_inflight", 0
+        ),
+        encode_status_timeout_ms=getattr(
+            parsed_args, "encode_status_timeout_ms", 200
+        ),
         dump_config_to=parsed_args.dump_config_to,
         enable_local_indexer=str(parsed_args.enable_local_indexer).lower() == "true",
         use_kv_events=use_kv_events,

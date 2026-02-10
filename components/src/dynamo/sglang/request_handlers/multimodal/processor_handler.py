@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import json
 import logging
 import time
@@ -37,9 +38,19 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
         component: Component,
         config: Config,
         encode_worker_client: Client,
+        encode_fallback_client: Client | None = None,
+        encode_primary_status_client: Client | None = None,
+        encode_fallback_status_client: Client | None = None,
     ):
         super().__init__(component, engine=None, config=config)
         self.encode_worker_client = encode_worker_client
+        self.encode_fallback_client = encode_fallback_client
+        self.encode_primary_status_client = encode_primary_status_client
+        self.encode_fallback_status_client = encode_fallback_status_client
+        self.encode_primary_max_inflight = (
+            config.dynamo_args.encode_primary_max_inflight
+        )
+        self.encode_status_timeout_ms = config.dynamo_args.encode_status_timeout_ms
         self.chat_template = getattr(config.server_args, "chat_template", "qwen2-vl")
         self.model = config.server_args.model_path
 
@@ -119,10 +130,23 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
             multimodal_inputs=multimodal_groups,
         )
 
-        # Send to encoder worker
-        response_generator = await self.encode_worker_client.round_robin(
-            worker_request.model_dump_json()
-        )
+        # Send to encoder worker (GPU primary, CPU fallback)
+        encode_client = await self._select_encode_client()
+        try:
+            response_generator = await encode_client.round_robin(
+                worker_request.model_dump_json()
+            )
+        except Exception as e:
+            if encode_client is self.encode_worker_client and self.encode_fallback_client:
+                logger.warning(
+                    "Primary encode worker failed, falling back to secondary: %s",
+                    e,
+                )
+                response_generator = await self.encode_fallback_client.round_robin(
+                    worker_request.model_dump_json()
+                )
+            else:
+                raise
 
         # Process and yield SGLang responses
         finished_sent = False
@@ -233,3 +257,50 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                 }
                 yield error_response
                 break
+
+    async def _select_encode_client(self) -> Client:
+        if self.encode_fallback_client is None:
+            return self.encode_worker_client
+
+        primary_has = bool(self.encode_worker_client.instance_ids())
+        fallback_has = bool(self.encode_fallback_client.instance_ids())
+
+        if primary_has and not fallback_has:
+            return self.encode_worker_client
+        if fallback_has and not primary_has:
+            return self.encode_fallback_client
+        if primary_has and fallback_has:
+            if await self._primary_is_busy():
+                return self.encode_fallback_client
+            return self.encode_worker_client
+
+        raise RuntimeError("No encode worker instances available")
+
+    async def _primary_is_busy(self) -> bool:
+        if self.encode_primary_max_inflight <= 0:
+            return False
+        if self.encode_primary_status_client is None:
+            return False
+
+        try:
+            inflight = await self._fetch_inflight(self.encode_primary_status_client)
+        except Exception as e:
+            logger.warning("Failed to query primary encode status: %s", e)
+            return False
+
+        return inflight >= self.encode_primary_max_inflight
+
+    async def _fetch_inflight(self, client: Client) -> int:
+        async def _query() -> int:
+            response_generator = await client.round_robin({})
+            async for resp in response_generator:
+                data = resp.data() if hasattr(resp, "data") else resp
+                if isinstance(data, str):
+                    data = json.loads(data)
+                return int(data.get("inflight", 0))
+            return 0
+
+        timeout = self.encode_status_timeout_ms / 1000.0
+        if timeout > 0:
+            return await asyncio.wait_for(_query(), timeout=timeout)
+        return await _query()
