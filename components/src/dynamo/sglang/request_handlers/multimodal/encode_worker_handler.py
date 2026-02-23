@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
+import os
 from typing import AsyncIterator, Optional
 
 import torch
@@ -23,6 +25,12 @@ from dynamo.sglang.protocol import SglangMultimodalRequest
 from dynamo.sglang.request_handlers.handler_base import BaseGenerativeHandler
 
 logger = logging.getLogger(__name__)
+
+
+def _get_reported_device() -> str:
+    """Device reported to upstream router for encoder instance selection."""
+    return "cpu" if os.getenv("SGLANG_USE_CPU_ENGINE") == "1" else "none-cpu"
+
 
 try:
     import cupy as array_module
@@ -107,6 +115,19 @@ class MultimodalEncodeWorkerHandler(BaseGenerativeHandler):
             request: Multimodal request with image/video data.
             context: Context object for cancellation handling.
         """
+        if isinstance(request, str):
+            try:
+                request_obj = json.loads(request)
+                if request_obj.get("_dynamo_probe_device") is True:
+                    yield json.dumps({"device": _get_reported_device()})
+                    return
+            except Exception:
+                pass
+        elif isinstance(request, dict):
+            if request.get("_dynamo_probe_device") is True:
+                yield json.dumps({"device": _get_reported_device()})
+                return
+
         if not isinstance(request, SglangMultimodalRequest):
             if isinstance(request, str):
                 request = SglangMultimodalRequest.model_validate_json(request)
