@@ -43,13 +43,22 @@ async def init_multimodal_processor(
     encode_worker_client = await runtime.endpoint(
         f"{dynamo_args.namespace}.encoder.generate"
     ).client()
+    pd_worker_client = await runtime.endpoint(
+        f"{dynamo_args.namespace}.backend.generate"
+    ).client()
 
     ready_event = asyncio.Event()
 
-    handler = MultimodalProcessorHandler(config, encode_worker_client, shutdown_event)
+    handler = MultimodalProcessorHandler(
+        config,
+        encode_worker_client,
+        pd_worker_client,
+        shutdown_event,
+    )
 
     logging.info("Waiting for Encoder Worker Instances ...")
     await encode_worker_client.wait_for_instances()
+    await pd_worker_client.wait_for_instances()
 
     try:
         _ = await asyncio.gather(

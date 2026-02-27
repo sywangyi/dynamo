@@ -125,6 +125,10 @@ class SglangMultimodalRequest(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     request: PreprocessedRequest
     multimodal_inputs: List[MultiModalGroup] = Field(default_factory=list)
+    # Internal control flag for processor fanout mode.
+    # When True, encode worker should return embeddings metadata only
+    # and skip forwarding to downstream worker.
+    encode_only: bool = False
     # Shared embedding transfer metadata for the entire multimodal request.
     embeddings_shape: Optional[
         Union[Tuple[int, int], Tuple[int, int, int], Tuple[int, int, int, int]]

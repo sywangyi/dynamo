@@ -4,13 +4,18 @@
 import asyncio
 import json
 import logging
+import math
+import os
 import time
 import uuid
 from collections import defaultdict
 from typing import Any, Dict, Optional
 
+import torch
+from sglang.srt.parser.conversation import chat_templates
 from transformers import AutoTokenizer
 
+import dynamo.nixl_connect as connect
 from dynamo._core import Client, Context
 from dynamo.sglang.args import Config
 from dynamo.sglang.multimodal_utils import (
@@ -38,18 +43,25 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         self,
         config: Config,
         encode_worker_client: Client,
+        pd_worker_client: Client,
         shutdown_event: Optional[asyncio.Event] = None,
     ):
         super().__init__(config)
         self.encode_worker_client = encode_worker_client
+        self.pd_worker_client = pd_worker_client
         self.chat_template = getattr(config.server_args, "chat_template", "qwen2-vl")
         self.model = config.server_args.model_path
         self.shutdown_event = shutdown_event
+        self.split_encode = os.getenv("DYN_SPLIT_ENCODE", "0") == "1"
+        self.split_encode_cpu_ratio = self._parse_cpu_ratio(
+            os.getenv("DYN_SPLIT_ENCODE_CPU_RATIO", "0")
+        )
         self._encoder_inflight: dict[int, int] = defaultdict(int)
         self._encoder_device: dict[int, str] = {}
         self._encoder_route_lock = asyncio.Lock()
         self._encoder_probe_lock = asyncio.Lock()
         self._encoder_rr_index = 0
+        self._connector = connect.Connector()
 
         # Initialize tokenizer for the model
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -60,8 +72,428 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             truncation_side="left",
         )
 
+        image_token_str = chat_templates[self.chat_template].copy().image_token
+        if image_token_str == "<|vision_start|><|image_pad|><|vision_end|>":
+            self.image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        else:
+            self.image_token_id = self.tokenizer.convert_tokens_to_ids(image_token_str)
+
+    @staticmethod
+    def _parse_cpu_ratio(raw: str) -> float:
+        """Parse CPU split ratio from env.
+
+        Accepts either fraction form (0.25) or percent form (25).
+        Values are clamped to [0.0, 1.0].
+        """
+        try:
+            ratio = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if ratio > 1.0:
+            ratio = ratio / 100.0
+        return max(0.0, min(1.0, ratio))
+
     def cleanup(self):
         pass
+
+    @staticmethod
+    def _parse_response_payload(resp):
+        if hasattr(resp, "data"):
+            raw_data = resp.data
+            if callable(raw_data):
+                raw_data = raw_data()
+            return raw_data
+        return resp
+
+    def _expand_image_placeholders(
+        self, token_ids: list[int], token_counts: list[int]
+    ) -> list[int]:
+        expanded = token_ids[:]
+        search_start = 0
+        for num_image_tokens in token_counts:
+            try:
+                image_token_id_index = expanded.index(self.image_token_id, search_start)
+            except ValueError as e:
+                raise ValueError(
+                    "Not enough image tokens found for provided images"
+                ) from e
+
+            expanded = (
+                expanded[:image_token_id_index]
+                + [self.image_token_id] * int(num_image_tokens)
+                + expanded[image_token_id_index + 1 :]
+            )
+            search_start = image_token_id_index + int(num_image_tokens)
+
+        return expanded
+
+    @staticmethod
+    def _infer_token_counts_from_grids(
+        image_grid_thw_list: list[list[int]], total_tokens: int
+    ) -> list[int]:
+        if total_tokens <= 0:
+            raise ValueError("Invalid token statistics for embeddings")
+
+        grid_sizes = []
+        for image_grid_thw in image_grid_thw_list:
+            if not isinstance(image_grid_thw, list) or len(image_grid_thw) != 3:
+                raise ValueError("Cannot split embeddings: invalid image_grid_thw")
+            grid_sizes.append(int(image_grid_thw[1] * image_grid_thw[2]))
+
+        total_grid_tokens = sum(grid_sizes)
+        if total_grid_tokens <= 0:
+            raise ValueError("Invalid grid statistics for embeddings")
+
+        if total_grid_tokens % total_tokens != 0:
+            raise ValueError(
+                "Cannot infer merge factor: grid token total is not divisible by embedding token total"
+            )
+
+        merge_factor = total_grid_tokens // total_tokens
+        token_counts = []
+        for grid_count in grid_sizes:
+            if grid_count % merge_factor != 0:
+                raise ValueError(
+                    "Cannot split embeddings: per-image grid token count not divisible by inferred merge factor"
+                )
+            token_counts.append(grid_count // merge_factor)
+
+        if sum(token_counts) != total_tokens:
+            raise ValueError(
+                "Cannot split embeddings: per-image token counts do not match embedding token total"
+            )
+
+        return token_counts
+
+    def _can_split_encode(self, multimodal_groups: list[MultiModalGroup]) -> bool:
+        if not self.split_encode or len(multimodal_groups) <= 1:
+            return False
+        return all(
+            group.multimodal_input is not None
+            and group.multimodal_input.image_url is not None
+            and group.multimodal_input.video_url is None
+            for group in multimodal_groups
+        )
+
+    async def _generate_split(
+        self,
+        request_id: str,
+        raw_request: MultiModalRequest,
+        sglang_request,
+        multimodal_groups: list[MultiModalGroup],
+    ):
+        encoded_groups: list[MultiModalGroup] = []
+        encoded_tensors: list[torch.Tensor] = []
+        image_token_counts: list[int] = []
+
+        instances = self.encode_worker_client.instance_ids()
+        if not instances:
+            instances = await self.encode_worker_client.wait_for_instances()
+        await self._probe_encoder_devices(instances)
+
+        cpu_instances = [
+            instance
+            for instance in instances
+            if self._encoder_device.get(instance) == "cpu"
+        ]
+        non_cpu_instances = [
+            instance
+            for instance in instances
+            if self._encoder_device.get(instance) == "none-cpu"
+        ]
+
+        total_images = len(multimodal_groups)
+        cpu_target = math.floor(total_images * self.split_encode_cpu_ratio)
+        if not cpu_instances:
+            cpu_target = 0
+        if not non_cpu_instances:
+            cpu_target = total_images
+
+        logger.debug(
+            "split encode plan: request=%s total_images=%d cpu_ratio=%.3f cpu_target=%d non_cpu_target=%d",
+            request_id,
+            total_images,
+            self.split_encode_cpu_ratio,
+            cpu_target,
+            total_images - cpu_target,
+        )
+        split_start_time = time.perf_counter()
+
+        async def _encode_batch(
+            src_groups: list[MultiModalGroup],
+            *,
+            prefer_device: str,
+            require_idle: bool = False,
+            avoid_device: str | None = None,
+            expected_count: int,
+            batch_name: str,
+        ) -> tuple[list[MultiModalGroup], torch.Tensor, list[int], float]:
+            batch_start_time = time.perf_counter()
+            batch_groups = [
+                MultiModalGroup(
+                    multimodal_input=MultiModalInput(
+                        image_url=group.multimodal_input.image_url
+                    )
+                )
+                for group in src_groups
+            ]
+            encode_request = SglangMultimodalRequest(
+                request=sglang_request.model_copy(deep=True),
+                multimodal_inputs=batch_groups,
+                encode_only=True,
+            )
+            encode_request.request.token_ids = [self.image_token_id] * len(batch_groups)
+
+            response_generator, selected_instance = await self._dispatch_to_encoder(
+                encode_request.model_dump_json(),
+                prefer_device=prefer_device,
+                require_idle=require_idle,
+                avoid_device=avoid_device,
+            )
+            try:
+                first = await anext(response_generator)
+                payload = self._parse_response_payload(first)
+                if isinstance(payload, str):
+                    encoded = SglangMultimodalRequest.model_validate_json(payload)
+                else:
+                    encoded = SglangMultimodalRequest.model_validate(payload)
+            finally:
+                if selected_instance is not None:
+                    await self._on_encoder_request_done(selected_instance)
+
+            if encoded.serialized_request is None or encoded.embeddings_shape is None:
+                raise RuntimeError("encode worker did not return embeddings metadata")
+            if not encoded.multimodal_inputs:
+                raise RuntimeError("encode worker did not return multimodal groups")
+            if len(encoded.multimodal_inputs) != expected_count:
+                raise RuntimeError(
+                    f"encode worker returned unexpected multimodal group count for {batch_name} batch"
+                )
+
+            embedding = torch.empty(
+                encoded.embeddings_shape,
+                dtype=torch.float16,
+                device="cpu",
+            )
+            descriptor = connect.Descriptor(embedding)
+            read_op = await self._connector.begin_read(
+                encoded.serialized_request, descriptor
+            )
+            await read_op.wait_for_completion()
+
+            grids = [group.image_grid_thw for group in encoded.multimodal_inputs]
+            if any(grid is None for grid in grids):
+                raise RuntimeError("encode worker did not return image_grid_thw")
+            token_counts = self._infer_token_counts_from_grids(
+                grids,
+                embedding.shape[0],
+            )
+
+            batch_latency_ms = (time.perf_counter() - batch_start_time) * 1000.0
+            logger.debug(
+                "split encode batch done: request=%s batch=%s images=%d prefer_device=%s selected_instance=%s latency_ms=%.2f",
+                request_id,
+                batch_name,
+                len(batch_groups),
+                prefer_device,
+                selected_instance,
+                batch_latency_ms,
+            )
+
+            return encoded.multimodal_inputs, embedding, token_counts, batch_latency_ms
+
+        cpu_groups = multimodal_groups[:cpu_target]
+        non_cpu_groups = multimodal_groups[cpu_target:]
+
+        def _split_into_subbatches(
+            groups: list[MultiModalGroup], max_parallelism: int
+        ) -> list[list[MultiModalGroup]]:
+            if not groups:
+                return []
+
+            parallelism = max(1, min(len(groups), max_parallelism))
+            base_size, remainder = divmod(len(groups), parallelism)
+
+            subbatches: list[list[MultiModalGroup]] = []
+            cursor = 0
+            for i in range(parallelism):
+                size = base_size + (1 if i < remainder else 0)
+                next_cursor = cursor + size
+                subbatches.append(groups[cursor:next_cursor])
+                cursor = next_cursor
+
+            return subbatches
+
+        cpu_parallelism = len(cpu_instances) if cpu_instances else 1
+        non_cpu_parallelism = len(non_cpu_instances) if non_cpu_instances else 1
+
+        cpu_subbatches = _split_into_subbatches(cpu_groups, cpu_parallelism)
+        non_cpu_subbatches = _split_into_subbatches(non_cpu_groups, non_cpu_parallelism)
+
+        batch_tasks = []
+
+        for i, subbatch in enumerate(cpu_subbatches):
+            batch_tasks.append(
+                asyncio.create_task(
+                    _encode_batch(
+                        subbatch,
+                        prefer_device="cpu",
+                        require_idle=(i < len(cpu_instances)),
+                        expected_count=len(subbatch),
+                        batch_name=f"cpu-{i}",
+                    )
+                )
+            )
+
+        for i, subbatch in enumerate(non_cpu_subbatches):
+            batch_tasks.append(
+                asyncio.create_task(
+                    _encode_batch(
+                        subbatch,
+                        prefer_device="none-cpu",
+                        avoid_device="cpu",
+                        expected_count=len(subbatch),
+                        batch_name=f"non-cpu-{i}",
+                    )
+                )
+            )
+
+        batch_results = await asyncio.gather(*batch_tasks)
+        for groups_result, embedding_result, token_counts_result, _ in batch_results:
+            encoded_groups.extend(groups_result)
+            encoded_tensors.append(embedding_result)
+            image_token_counts.extend(token_counts_result)
+
+        split_encode_latency_ms = (time.perf_counter() - split_start_time) * 1000.0
+        logger.debug(
+            "split encode merge-ready: request=%s total_images=%d cpu_images=%d non_cpu_images=%d cpu_batches=%d non_cpu_batches=%d total_latency_ms=%.2f",
+            request_id,
+            total_images,
+            len(cpu_groups),
+            len(non_cpu_groups),
+            len(cpu_subbatches),
+            len(non_cpu_subbatches),
+            split_encode_latency_ms,
+        )
+
+        for src_group, encoded_group in zip(multimodal_groups, encoded_groups, strict=True):
+            src_group.image_grid_thw = encoded_group.image_grid_thw
+            if src_group.multimodal_input is not None:
+                src_group.multimodal_input.image_url = None
+
+        merged_embeddings = (
+            torch.cat(encoded_tensors, dim=0)
+            if len(encoded_tensors) > 1
+            else encoded_tensors[0]
+        )
+
+        merged_request = SglangMultimodalRequest(
+            request=sglang_request,
+            multimodal_inputs=multimodal_groups,
+        )
+        merged_request.request.token_ids = self._expand_image_placeholders(
+            merged_request.request.token_ids,
+            image_token_counts,
+        )
+        merged_request.embeddings_shape = tuple(merged_embeddings.shape)
+        merged_request.serialized_request = None
+
+        descriptor = connect.Descriptor(merged_embeddings)
+        with await self._connector.create_readable(descriptor) as readable:
+            merged_request.serialized_request = readable.metadata()
+            response_generator = await self.pd_worker_client.round_robin(
+                merged_request.model_dump_json()
+            )
+
+            finished_sent = False
+            accumulated_text = ""
+            async for resp in response_generator:
+                try:
+                    raw_data = self._parse_response_payload(resp)
+                    if isinstance(raw_data, str):
+                        try:
+                            response_data = json.loads(raw_data)
+                        except json.JSONDecodeError:
+                            response_data = {"text": raw_data, "finished": False}
+                    else:
+                        response_data = raw_data
+
+                    (
+                        text_content,
+                        accumulated_text,
+                        is_finished,
+                    ) = process_sglang_stream_response(
+                        response_data, self.tokenizer, accumulated_text
+                    )
+
+                    if text_content or is_finished:
+                        choice: Dict[str, Any] = {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": None,
+                        }
+                        delta: Dict[str, str] = choice["delta"]
+
+                        if text_content and not finished_sent:
+                            delta["role"] = "assistant"
+
+                        if text_content:
+                            delta["content"] = text_content
+
+                        if is_finished:
+                            choice["finish_reason"] = response_data.get(
+                                "finish_reason", "stop"
+                            )
+                            if not finished_sent and not text_content:
+                                delta["role"] = "assistant"
+
+                        response_json = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": self.model,
+                            "choices": [choice],
+                        }
+
+                        if is_finished:
+                            response_json["usage"] = {
+                                "prompt_tokens": 0,
+                                "completion_tokens": len(accumulated_text.split())
+                                if accumulated_text
+                                else 0,
+                                "total_tokens": len(accumulated_text.split())
+                                if accumulated_text
+                                else 0,
+                            }
+
+                        yield response_json
+
+                        if is_finished:
+                            finished_sent = True
+                            break
+
+                except Exception as e:
+                    logger.error(f"Error processing SGLang response: {e}")
+                    yield {
+                        "id": f"chatcmpl-{request_id}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": self.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": f"Error: {str(e)}",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    break
+
+            await readable.wait_for_completion()
 
     async def generate(self, raw_request: MultiModalRequest, context: Context):
         """
@@ -129,6 +561,22 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             request=sglang_request,
             multimodal_inputs=multimodal_groups,
         )
+
+        if self._can_split_encode(multimodal_groups):
+            try:
+                async for item in self._generate_split(
+                    request_id,
+                    raw_request,
+                    sglang_request,
+                    multimodal_groups,
+                ):
+                    yield item
+                return
+            except Exception:
+                logger.exception(
+                    "split encode path failed for request %s; falling back to single-encoder path",
+                    request_id,
+                )
 
         # Send to encoder worker using load-aware routing
         response_generator, selected_instance = await self._dispatch_to_encoder(
@@ -252,7 +700,14 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             if selected_instance is not None:
                 await self._on_encoder_request_done(selected_instance)
 
-    async def _dispatch_to_encoder(self, payload: str):
+    async def _dispatch_to_encoder(
+        self,
+        payload: str,
+        *,
+        prefer_device: str | None = None,
+        require_idle: bool = False,
+        avoid_device: str | None = None,
+    ):
         """Dispatch request to encoder worker using least in-flight routing.
 
         Returns:
@@ -282,60 +737,41 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             if sorted_instances:
                 start = self._encoder_rr_index % len(sorted_instances)
                 tie_break_order = sorted_instances[start:] + sorted_instances[:start]
-                cpu_busy = any(
-                    self._encoder_device.get(instance) == "cpu"
-                    and self._encoder_inflight.get(instance, 0) > 0
-                    for instance in tie_break_order
-                )
 
-                if cpu_busy:
-                    non_cpu_instances = [
+                candidate_instances = tie_break_order
+                if avoid_device is not None:
+                    filtered = [
                         instance
-                        for instance in tie_break_order
-                        if self._encoder_device.get(instance) == "none-cpu"
+                        for instance in candidate_instances
+                        if self._encoder_device.get(instance) != avoid_device
                     ]
-                    if non_cpu_instances:
-                        min_inflight = min(
-                            self._encoder_inflight.get(instance, 0)
-                            for instance in non_cpu_instances
-                        )
-                        selected_instance = next(
+                    if filtered:
+                        candidate_instances = filtered
+
+                if prefer_device is not None:
+                    preferred = [
+                        instance
+                        for instance in candidate_instances
+                        if self._encoder_device.get(instance) == prefer_device
+                    ]
+                    if require_idle:
+                        preferred = [
                             instance
-                            for instance in non_cpu_instances
-                            if self._encoder_inflight.get(instance, 0)
-                            == min_inflight
-                        )
-                    else:
-                        min_inflight = min(
-                            self._encoder_inflight.get(instance, 0)
-                            for instance in tie_break_order
-                        )
-                        selected_instance = next(
-                            instance
-                            for instance in tie_break_order
-                            if self._encoder_inflight.get(instance, 0)
-                            == min_inflight
-                        )
-                else:
-                    min_inflight = min(
-                        self._encoder_inflight.get(instance, 0)
-                        for instance in tie_break_order
-                    )
-                    min_inflight_candidates = [
-                        instance
-                        for instance in tie_break_order
-                        if self._encoder_inflight.get(instance, 0) == min_inflight
-                    ]
-                    non_cpu_tied_candidates = [
-                        instance
-                        for instance in min_inflight_candidates
-                        if self._encoder_device.get(instance) == "none-cpu"
-                    ]
-                    selected_instance = (
-                        non_cpu_tied_candidates[0]
-                        if non_cpu_tied_candidates
-                        else min_inflight_candidates[0]
-                    )
+                            for instance in preferred
+                            if self._encoder_inflight.get(instance, 0) == 0
+                        ]
+                    if preferred:
+                        candidate_instances = preferred
+
+                min_inflight = min(
+                    self._encoder_inflight.get(instance, 0)
+                    for instance in candidate_instances
+                )
+                selected_instance = next(
+                    instance
+                    for instance in candidate_instances
+                    if self._encoder_inflight.get(instance, 0) == min_inflight
+                )
 
                 self._encoder_rr_index = (start + 1) % len(sorted_instances)
                 self._encoder_inflight[selected_instance] += 1

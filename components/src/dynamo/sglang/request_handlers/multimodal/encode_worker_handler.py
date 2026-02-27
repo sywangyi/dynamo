@@ -246,28 +246,34 @@ class MultimodalEncodeWorkerHandler(BaseGenerativeHandler):
             request.embeddings_shape = tuple(precomputed_embeddings.shape)
             request.serialized_request = None
 
-            search_start = 0
-            for num_image_tokens in token_counts:
-                try:
-                    image_token_id_index = request.request.token_ids.index(
-                        self.image_token_id, search_start
-                    )
-                except ValueError as e:
-                    raise ValueError(
-                        "Not enough image tokens found for provided images"
-                    ) from e
+            if not request.encode_only:
+                search_start = 0
+                for num_image_tokens in token_counts:
+                    try:
+                        image_token_id_index = request.request.token_ids.index(
+                            self.image_token_id, search_start
+                        )
+                    except ValueError as e:
+                        raise ValueError(
+                            "Not enough image tokens found for provided images"
+                        ) from e
 
-                request.request.token_ids = (
-                    request.request.token_ids[:image_token_id_index]
-                    + [self.image_token_id] * num_image_tokens
-                    + request.request.token_ids[image_token_id_index + 1 :]
-                )
-                search_start = image_token_id_index + num_image_tokens
+                    request.request.token_ids = (
+                        request.request.token_ids[:image_token_id_index]
+                        + [self.image_token_id] * num_image_tokens
+                        + request.request.token_ids[image_token_id_index + 1 :]
+                    )
+                    search_start = image_token_id_index + num_image_tokens
 
             descriptor = connect.Descriptor(precomputed_embeddings)
             with await self._connector.create_readable(descriptor) as readable:
                 request.serialized_request = readable.metadata()
                 logger.debug(f"Request: {request.model_dump_json()}")
+
+                if request.encode_only:
+                    yield request.model_dump_json()
+                    await readable.wait_for_completion()
+                    return
 
                 # Get the response generator from downstream worker
                 response_generator = await self.pd_worker_client.round_robin(
