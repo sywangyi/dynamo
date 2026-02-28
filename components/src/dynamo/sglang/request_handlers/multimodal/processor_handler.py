@@ -167,14 +167,44 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
         return token_counts
 
-    def _can_split_encode(self, multimodal_groups: list[MultiModalGroup]) -> bool:
-        if not self.split_encode or len(multimodal_groups) <= 1:
+    def _can_split_encode(
+        self,
+        multimodal_groups: list[MultiModalGroup],
+        valid_encode_instances: int,
+    ) -> bool:
+        if (
+            not self.split_encode
+            or len(multimodal_groups) <= 1
+            or valid_encode_instances <= 1
+        ):
             return False
         return all(
             group.multimodal_input is not None
             and group.multimodal_input.image_url is not None
             and group.multimodal_input.video_url is None
             for group in multimodal_groups
+        )
+
+    async def _count_valid_encode_instances(self) -> int:
+        instances = self.encode_worker_client.instance_ids()
+        if not instances:
+            return 0
+
+        await self._probe_encoder_devices(instances)
+
+        async with self._encoder_route_lock:
+            inflight_snapshot = dict(self._encoder_inflight)
+
+        return sum(
+            1
+            for instance in instances
+            if (
+                self._encoder_device.get(instance) == "none-cpu"
+                or (
+                    self._encoder_device.get(instance) == "cpu"
+                    and inflight_snapshot.get(instance, 0) == 0
+                )
+            )
         )
 
     async def _generate_split(
@@ -575,7 +605,8 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             multimodal_inputs=multimodal_groups,
         )
 
-        if self._can_split_encode(multimodal_groups):
+        valid_encode_instances = await self._count_valid_encode_instances()
+        if self._can_split_encode(multimodal_groups, valid_encode_instances):
             try:
                 async for item in self._generate_split(
                     request_id,
