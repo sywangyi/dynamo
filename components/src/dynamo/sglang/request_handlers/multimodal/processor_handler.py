@@ -383,12 +383,17 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             split_encode_latency_ms,
         )
 
-        for src_group, encoded_group in zip(
-            multimodal_groups, encoded_groups, strict=True
-        ):
-            src_group.image_grid_thw = encoded_group.image_grid_thw
-            if src_group.multimodal_input is not None:
-                src_group.multimodal_input.image_url = None
+        merged_multimodal_groups: list[MultiModalGroup] = []
+        if len(multimodal_groups) != len(encoded_groups):
+            raise RuntimeError(
+                "split encode merge mismatch: encoded group count does not match source group count"
+            )
+        for encoded_group in encoded_groups:
+            merged_group = MultiModalGroup(
+                multimodal_input=MultiModalInput(image_url=None, video_url=None),
+                image_grid_thw=encoded_group.image_grid_thw,
+            )
+            merged_multimodal_groups.append(merged_group)
 
         merged_embeddings = (
             torch.cat(encoded_tensors, dim=0)
@@ -398,7 +403,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
         merged_request = SglangMultimodalRequest(
             request=sglang_request,
-            multimodal_inputs=multimodal_groups,
+            multimodal_inputs=merged_multimodal_groups,
         )
         merged_request.request.token_ids = self._expand_image_placeholders(
             merged_request.request.token_ids,
