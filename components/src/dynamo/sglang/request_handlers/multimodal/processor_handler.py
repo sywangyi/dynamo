@@ -9,6 +9,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import torch
@@ -192,10 +193,14 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             instances = await self.encode_worker_client.wait_for_instances()
         await self._probe_encoder_devices(instances)
 
+        async with self._encoder_route_lock:
+            inflight_snapshot = dict(self._encoder_inflight)
+
         cpu_instances = [
             instance
             for instance in instances
             if self._encoder_device.get(instance) == "cpu"
+            and inflight_snapshot.get(instance, 0) == 0
         ]
         non_cpu_instances = [
             instance
@@ -238,8 +243,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 )
                 for group in src_groups
             ]
+            request_copy = deepcopy(sglang_request)
             encode_request = SglangMultimodalRequest(
-                request=sglang_request.model_copy(deep=True),
+                request=request_copy,
                 multimodal_inputs=batch_groups,
                 encode_only=True,
             )
@@ -377,7 +383,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             split_encode_latency_ms,
         )
 
-        for src_group, encoded_group in zip(multimodal_groups, encoded_groups, strict=True):
+        for src_group, encoded_group in zip(
+            multimodal_groups, encoded_groups, strict=True
+        ):
             src_group.image_grid_thw = encoded_group.image_grid_thw
             if src_group.multimodal_input is not None:
                 src_group.multimodal_input.image_url = None
