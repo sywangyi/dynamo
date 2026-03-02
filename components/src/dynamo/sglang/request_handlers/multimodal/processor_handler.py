@@ -57,6 +57,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         self.split_encode_cpu_ratio = self._parse_cpu_ratio(
             os.getenv("DYN_SPLIT_ENCODE_CPU_RATIO", "0")
         )
+        self.split_encode_idle_poll_interval_ms = self._parse_non_negative_int(
+            os.getenv("DYN_SPLIT_ENCODE_IDLE_POLL_INTERVAL_MS", "500")
+        )
         self._encoder_inflight: dict[int, int] = defaultdict(int)
         self._encoder_device: dict[int, str] = {}
         self._encoder_route_lock = asyncio.Lock()
@@ -94,6 +97,14 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         if ratio > 1.0:
             ratio = ratio / 100.0
         return max(0.0, min(1.0, ratio))
+
+    @staticmethod
+    def _parse_non_negative_int(raw: str) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, value)
 
     def cleanup(self):
         pass
@@ -206,6 +217,49 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 )
             )
         )
+
+    async def _count_idle_encode_instances(self) -> int:
+        instances = self.encode_worker_client.instance_ids()
+        if not instances:
+            return 0
+
+        await self._probe_encoder_devices(instances)
+
+        async with self._encoder_route_lock:
+            inflight_snapshot = dict(self._encoder_inflight)
+
+        return sum(
+            1
+            for instance in instances
+            if self._encoder_device.get(instance) in {"none-cpu", "cpu"}
+            and inflight_snapshot.get(instance, 0) == 0
+        )
+
+    async def _wait_for_idle_encode_instance(
+        self,
+        request_id: str,
+    ) -> int:
+        idle_encode_instances = await self._count_idle_encode_instances()
+        if idle_encode_instances > 0:
+            return idle_encode_instances
+
+        poll_interval_s = max(self.split_encode_idle_poll_interval_ms, 1) / 1000.0
+        logger.debug(
+            "split encode idle wait start: request=%s poll_interval_ms=%d",
+            request_id,
+            self.split_encode_idle_poll_interval_ms,
+        )
+
+        while idle_encode_instances == 0:
+            await asyncio.sleep(poll_interval_s)
+            idle_encode_instances = await self._count_idle_encode_instances()
+
+        logger.debug(
+            "split encode idle wait done: request=%s idle_instances=%d",
+            request_id,
+            idle_encode_instances,
+        )
+        return idle_encode_instances
 
     async def _generate_split(
         self,
@@ -327,7 +381,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             )
 
             batch_latency_ms = (time.perf_counter() - batch_start_time) * 1000.0
-            logger.debug(
+            logger.info(
                 "split encode batch done: request=%s batch=%s images=%d prefer_device=%s selected_instance=%s latency_ms=%.2f",
                 request_id,
                 batch_name,
@@ -402,7 +456,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             image_token_counts.extend(token_counts_result)
 
         split_encode_latency_ms = (time.perf_counter() - split_start_time) * 1000.0
-        logger.debug(
+        logger.info(
             "split encode merge-ready: request=%s total_images=%d cpu_images=%d non_cpu_images=%d cpu_batches=%d non_cpu_batches=%d total_latency_ms=%.2f",
             request_id,
             total_images,
@@ -606,7 +660,10 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         )
 
         valid_encode_instances = await self._count_valid_encode_instances()
-        if self._can_split_encode(multimodal_groups, valid_encode_instances):
+        idle_encode_instances = await self._wait_for_idle_encode_instance(request_id)
+        if self._can_split_encode(multimodal_groups, valid_encode_instances) and (
+            idle_encode_instances > 0
+        ):
             try:
                 async for item in self._generate_split(
                     request_id,
@@ -823,7 +880,21 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 selected_instance = None
 
         if selected_instance is None:
+            logger.info(
+                "encoder dispatch route=round_robin selected_instance=None selected_device=unknown reason=no_active_instance"
+            )
             return await self.encode_worker_client.round_robin(payload), None
+
+        selected_device = self._encoder_device.get(selected_instance, "unknown")
+        logger.info(
+            "encoder dispatch route=direct selected_instance=%s selected_device=%s prefer_device=%s avoid_device=%s require_idle=%s inflight=%s",
+            selected_instance,
+            selected_device,
+            prefer_device,
+            avoid_device,
+            require_idle,
+            self._encoder_inflight.get(selected_instance, 0),
+        )
 
         try:
             response_generator = await self.encode_worker_client.direct(
@@ -832,8 +903,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             return response_generator, selected_instance
         except Exception:
             logger.exception(
-                "Failed direct dispatch to encoder instance %s, falling back to round_robin",
+                "Failed direct dispatch to encoder instance %s (device=%s), falling back to round_robin",
                 selected_instance,
+                selected_device,
             )
             await self._on_encoder_request_done(selected_instance)
             return await self.encode_worker_client.round_robin(payload), None
