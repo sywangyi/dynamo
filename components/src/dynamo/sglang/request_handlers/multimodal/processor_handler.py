@@ -64,7 +64,11 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         self._encoder_device: dict[int, str] = {}
         self._encoder_route_lock = asyncio.Lock()
         self._encoder_probe_lock = asyncio.Lock()
+        self._split_metrics_lock = asyncio.Lock()
         self._encoder_rr_index = 0
+        self._total_requests = 0
+        self._split_attempt_requests = 0
+        self._single_path_requests = 0
         self._connector = connect.Connector()
 
         # Initialize tokenizer for the model
@@ -261,6 +265,23 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         )
         return idle_encode_instances
 
+    async def _record_request_path(self, request_id: str, path: str) -> None:
+        async with self._split_metrics_lock:
+            self._total_requests += 1
+            if path == "split":
+                self._split_attempt_requests += 1
+            else:
+                self._single_path_requests += 1
+
+            logger.info(
+                "encode path metrics: request=%s path=%s total=%d split_attempt=%d single=%d",
+                request_id,
+                path,
+                self._total_requests,
+                self._split_attempt_requests,
+                self._single_path_requests,
+            )
+
     async def _generate_split(
         self,
         request_id: str,
@@ -313,7 +334,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             src_groups: list[MultiModalGroup],
             *,
             prefer_device: str,
-            require_idle: bool = False,
+            require_idle: bool = True,
             avoid_device: str | None = None,
             expected_count: int,
             batch_name: str,
@@ -664,6 +685,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         if self._can_split_encode(multimodal_groups, valid_encode_instances) and (
             idle_encode_instances > 0
         ):
+            await self._record_request_path(request_id, "split")
             try:
                 async for item in self._generate_split(
                     request_id,
@@ -678,6 +700,8 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                     "split encode path failed for request %s; falling back to single-encoder path",
                     request_id,
                 )
+
+            await self._record_request_path(request_id, "single")
 
         # Send to encoder worker using load-aware routing
         response_generator, selected_instance = await self._dispatch_to_encoder(
@@ -822,82 +846,100 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 - Response generator
                 - Selected instance id if direct routing was used
         """
-        instances = self.encode_worker_client.instance_ids()
-        if not instances:
-            instances = await self.encode_worker_client.wait_for_instances()
+        poll_interval_s = max(self.split_encode_idle_poll_interval_ms, 1) / 1000.0
 
-        await self._probe_encoder_devices(instances)
+        while True:
+            instances = self.encode_worker_client.instance_ids()
+            if not instances:
+                instances = await self.encode_worker_client.wait_for_instances()
 
-        async with self._encoder_route_lock:
-            active_set = set(instances)
-            for stale_instance in list(self._encoder_inflight.keys()):
-                if stale_instance not in active_set:
-                    del self._encoder_inflight[stale_instance]
-            for stale_instance in list(self._encoder_device.keys()):
-                if stale_instance not in active_set:
-                    del self._encoder_device[stale_instance]
+            await self._probe_encoder_devices(instances)
 
-            for instance in instances:
-                self._encoder_inflight.setdefault(instance, 0)
+            should_wait_for_idle = False
+            async with self._encoder_route_lock:
+                active_set = set(instances)
+                for stale_instance in list(self._encoder_inflight.keys()):
+                    if stale_instance not in active_set:
+                        del self._encoder_inflight[stale_instance]
+                for stale_instance in list(self._encoder_device.keys()):
+                    if stale_instance not in active_set:
+                        del self._encoder_device[stale_instance]
 
-            sorted_instances = sorted(instances)
-            if sorted_instances:
-                start = self._encoder_rr_index % len(sorted_instances)
-                tie_break_order = sorted_instances[start:] + sorted_instances[:start]
+                for instance in instances:
+                    self._encoder_inflight.setdefault(instance, 0)
 
-                candidate_instances = tie_break_order
-                if avoid_device is not None:
-                    filtered = [
-                        instance
-                        for instance in candidate_instances
-                        if self._encoder_device.get(instance) != avoid_device
-                    ]
-                    if filtered:
-                        candidate_instances = filtered
+                sorted_instances = sorted(instances)
+                if sorted_instances:
+                    start = self._encoder_rr_index % len(sorted_instances)
+                    tie_break_order = (
+                        sorted_instances[start:] + sorted_instances[:start]
+                    )
 
-                if prefer_device is not None:
-                    preferred = [
-                        instance
-                        for instance in candidate_instances
-                        if self._encoder_device.get(instance) == prefer_device
-                    ]
-                    if require_idle:
-                        preferred = [
-                            instance
-                            for instance in preferred
-                            if self._encoder_inflight.get(instance, 0) == 0
-                        ]
-                    if preferred:
-                        candidate_instances = preferred
-                    elif fallback_device is not None:
-                        fallback = [
+                    candidate_instances = tie_break_order
+                    if avoid_device is not None:
+                        filtered = [
                             instance
                             for instance in candidate_instances
-                            if self._encoder_device.get(instance) == fallback_device
+                            if self._encoder_device.get(instance) != avoid_device
                         ]
-                        if fallback_require_idle:
-                            fallback = [
+                        if filtered:
+                            candidate_instances = filtered
+
+                    if prefer_device is not None:
+                        preferred = [
+                            instance
+                            for instance in candidate_instances
+                            if self._encoder_device.get(instance) == prefer_device
+                        ]
+                        if require_idle:
+                            preferred = [
                                 instance
-                                for instance in fallback
+                                for instance in preferred
                                 if self._encoder_inflight.get(instance, 0) == 0
                             ]
-                        if fallback:
-                            candidate_instances = fallback
+                        if preferred:
+                            candidate_instances = preferred
+                        elif fallback_device is not None:
+                            fallback = [
+                                instance
+                                for instance in candidate_instances
+                                if self._encoder_device.get(instance) == fallback_device
+                            ]
+                            if fallback_require_idle:
+                                fallback = [
+                                    instance
+                                    for instance in fallback
+                                    if self._encoder_inflight.get(instance, 0) == 0
+                                ]
+                            if fallback:
+                                candidate_instances = fallback
+                            elif fallback_require_idle:
+                                should_wait_for_idle = True
+                        elif require_idle:
+                            should_wait_for_idle = True
 
-                min_inflight = min(
-                    self._encoder_inflight.get(instance, 0)
-                    for instance in candidate_instances
-                )
-                selected_instance = next(
-                    instance
-                    for instance in candidate_instances
-                    if self._encoder_inflight.get(instance, 0) == min_inflight
-                )
+                    if should_wait_for_idle:
+                        selected_instance = None
+                    else:
+                        min_inflight = min(
+                            self._encoder_inflight.get(instance, 0)
+                            for instance in candidate_instances
+                        )
+                        selected_instance = next(
+                            instance
+                            for instance in candidate_instances
+                            if self._encoder_inflight.get(instance, 0) == min_inflight
+                        )
 
-                self._encoder_rr_index = (start + 1) % len(sorted_instances)
-                self._encoder_inflight[selected_instance] += 1
-            else:
-                selected_instance = None
+                        self._encoder_rr_index = (start + 1) % len(sorted_instances)
+                        self._encoder_inflight[selected_instance] += 1
+                else:
+                    selected_instance = None
+
+            if should_wait_for_idle:
+                await asyncio.sleep(poll_interval_s)
+                continue
+            break
 
         if selected_instance is None:
             logger.info(
