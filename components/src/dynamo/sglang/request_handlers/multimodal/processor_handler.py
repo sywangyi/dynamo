@@ -57,9 +57,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         self.split_encode_cpu_ratio = self._parse_cpu_ratio(
             os.getenv("DYN_SPLIT_ENCODE_CPU_RATIO", "0")
         )
-        self.split_encode_idle_poll_interval_ms = self._parse_non_negative_int(
-            os.getenv("DYN_SPLIT_ENCODE_IDLE_POLL_INTERVAL_MS", "500")
-        )
         self._encoder_inflight: dict[int, int] = defaultdict(int)
         self._encoder_device: dict[int, str] = {}
         self._encoder_route_lock = asyncio.Lock()
@@ -101,14 +98,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         if ratio > 1.0:
             ratio = ratio / 100.0
         return max(0.0, min(1.0, ratio))
-
-    @staticmethod
-    def _parse_non_negative_int(raw: str) -> int:
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return 0
-        return max(0, value)
 
     def cleanup(self):
         pass
@@ -214,9 +203,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             1
             for instance in instances
             if (
-                (
-                    self._encoder_device.get(instance) == "none-cpu"
-                )
+                (self._encoder_device.get(instance) == "none-cpu")
                 or (
                     self._encoder_device.get(instance) == "cpu"
                     and inflight_snapshot.get(instance, 0) == 0
@@ -239,6 +226,22 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             for instance in instances
             if self._encoder_device.get(instance) in {"none-cpu", "cpu"}
             and inflight_snapshot.get(instance, 0) == 0
+        )
+
+    async def _has_idle_cpu_encode_instance(self) -> bool:
+        instances = self.encode_worker_client.instance_ids()
+        if not instances:
+            return False
+
+        await self._probe_encoder_devices(instances)
+
+        async with self._encoder_route_lock:
+            inflight_snapshot = dict(self._encoder_inflight)
+
+        return any(
+            self._encoder_device.get(instance) == "cpu"
+            and inflight_snapshot.get(instance, 0) == 0
+            for instance in instances
         )
 
     async def _record_request_path(self, request_id: str, path: str) -> None:
@@ -311,7 +314,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             src_groups: list[MultiModalGroup],
             *,
             prefer_device: str,
-            require_idle: bool = True,
             avoid_device: str | None = None,
             expected_count: int,
             batch_name: str,
@@ -335,7 +337,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             response_generator, selected_instance = await self._dispatch_to_encoder(
                 encode_request.model_dump_json(),
                 prefer_device=prefer_device,
-                require_idle=require_idle,
                 avoid_device=avoid_device,
             )
             batch_start_time = time.perf_counter()
@@ -427,7 +428,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                     _encode_batch(
                         subbatch,
                         prefer_device="cpu",
-                        require_idle=(i < len(cpu_instances)),
                         expected_count=len(subbatch),
                         batch_name=f"cpu-{i}",
                     )
@@ -440,7 +440,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                     _encode_batch(
                         subbatch,
                         prefer_device="none-cpu",
-                        require_idle=False,
                         avoid_device="cpu",
                         expected_count=len(subbatch),
                         batch_name=f"non-cpu-{i}",
@@ -681,14 +680,21 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
             await self._record_request_path(request_id, "single")
 
-        # Send to encoder worker using load-aware routing
-        response_generator, selected_instance = await self._dispatch_to_encoder(
-            worker_request.model_dump_json(),
-            prefer_device="none-cpu",
-            require_idle=False,
-            fallback_device="cpu",
-            fallback_require_idle=True,
-        )
+        # Send to encoder worker using load-aware routing.
+        # Non-split policy:
+        # - If any CPU instance is idle, route by global min in-flight across CPU/non-CPU.
+        # - If CPU is busy, prefer non-CPU and avoid CPU when possible.
+        has_idle_cpu = await self._has_idle_cpu_encode_instance()
+        if has_idle_cpu:
+            response_generator, selected_instance = await self._dispatch_to_encoder(
+                worker_request.model_dump_json()
+            )
+        else:
+            response_generator, selected_instance = await self._dispatch_to_encoder(
+                worker_request.model_dump_json(),
+                prefer_device="none-cpu",
+                avoid_device="cpu",
+            )
 
         # Process and yield SGLang responses
         finished_sent = False
@@ -812,10 +818,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         payload: str,
         *,
         prefer_device: str | None = None,
-        require_idle: bool = False,
         avoid_device: str | None = None,
-        fallback_device: str | None = None,
-        fallback_require_idle: bool = False,
     ):
         """Dispatch request to encoder worker using least in-flight routing.
 
@@ -824,100 +827,70 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 - Response generator
                 - Selected instance id if direct routing was used
         """
-        poll_interval_s = max(self.split_encode_idle_poll_interval_ms, 1) / 1000.0
+        instances = self.encode_worker_client.instance_ids()
+        if not instances:
+            instances = await self.encode_worker_client.wait_for_instances()
 
-        while True:
-            instances = self.encode_worker_client.instance_ids()
-            if not instances:
-                instances = await self.encode_worker_client.wait_for_instances()
+        await self._probe_encoder_devices(instances)
 
-            await self._probe_encoder_devices(instances)
+        async with self._encoder_route_lock:
+            active_set = set(instances)
+            for stale_instance in list(self._encoder_inflight.keys()):
+                if stale_instance not in active_set:
+                    del self._encoder_inflight[stale_instance]
+            for stale_instance in list(self._encoder_device.keys()):
+                if stale_instance not in active_set:
+                    del self._encoder_device[stale_instance]
 
-            should_wait_for_idle = False
-            async with self._encoder_route_lock:
-                active_set = set(instances)
-                for stale_instance in list(self._encoder_inflight.keys()):
-                    if stale_instance not in active_set:
-                        del self._encoder_inflight[stale_instance]
-                for stale_instance in list(self._encoder_device.keys()):
-                    if stale_instance not in active_set:
-                        del self._encoder_device[stale_instance]
+            for instance in instances:
+                self._encoder_inflight.setdefault(instance, 0)
 
-                for instance in instances:
-                    self._encoder_inflight.setdefault(instance, 0)
+            sorted_instances = sorted(instances)
+            if sorted_instances:
+                start = self._encoder_rr_index % len(sorted_instances)
+                tie_break_order = sorted_instances[start:] + sorted_instances[:start]
 
-                sorted_instances = sorted(instances)
-                if sorted_instances:
-                    start = self._encoder_rr_index % len(sorted_instances)
-                    tie_break_order = (
-                        sorted_instances[start:] + sorted_instances[:start]
-                    )
+                candidate_instances = tie_break_order
+                if avoid_device is not None:
+                    filtered = [
+                        instance
+                        for instance in candidate_instances
+                        if self._encoder_device.get(instance) != avoid_device
+                    ]
+                    if filtered:
+                        candidate_instances = filtered
 
-                    candidate_instances = tie_break_order
-                    if avoid_device is not None:
-                        filtered = [
-                            instance
-                            for instance in candidate_instances
-                            if self._encoder_device.get(instance) != avoid_device
-                        ]
-                        if filtered:
-                            candidate_instances = filtered
+                if prefer_device is not None:
+                    preferred = [
+                        instance
+                        for instance in candidate_instances
+                        if self._encoder_device.get(instance) == prefer_device
+                    ]
+                    if preferred:
+                        candidate_instances = preferred
 
-                    if prefer_device is not None:
-                        preferred = [
-                            instance
-                            for instance in candidate_instances
-                            if self._encoder_device.get(instance) == prefer_device
-                        ]
-                        if require_idle:
-                            preferred = [
-                                instance
-                                for instance in preferred
-                                if self._encoder_inflight.get(instance, 0) == 0
-                            ]
-                        if preferred:
-                            candidate_instances = preferred
-                        elif fallback_device is not None:
-                            fallback = [
-                                instance
-                                for instance in candidate_instances
-                                if self._encoder_device.get(instance) == fallback_device
-                            ]
-                            if fallback_require_idle:
-                                fallback = [
-                                    instance
-                                    for instance in fallback
-                                    if self._encoder_inflight.get(instance, 0) == 0
-                                ]
-                            if fallback:
-                                candidate_instances = fallback
-                            elif fallback_require_idle:
-                                should_wait_for_idle = True
-                        elif require_idle:
-                            should_wait_for_idle = True
+                min_inflight = min(
+                    self._encoder_inflight.get(instance, 0)
+                    for instance in candidate_instances
+                )
+                min_inflight_instances = [
+                    instance
+                    for instance in candidate_instances
+                    if self._encoder_inflight.get(instance, 0) == min_inflight
+                ]
+                selected_instance = next(
+                    (
+                        instance
+                        for instance in min_inflight_instances
+                        if self._encoder_device.get(instance) == "none-cpu"
+                    ),
+                    min_inflight_instances[0],
+                )
 
-                    if should_wait_for_idle:
-                        selected_instance = None
-                    else:
-                        min_inflight = min(
-                            self._encoder_inflight.get(instance, 0)
-                            for instance in candidate_instances
-                        )
-                        selected_instance = next(
-                            instance
-                            for instance in candidate_instances
-                            if self._encoder_inflight.get(instance, 0) == min_inflight
-                        )
-
-                        self._encoder_rr_index = (start + 1) % len(sorted_instances)
-                        self._encoder_inflight[selected_instance] += 1
-                else:
-                    selected_instance = None
-
-            if should_wait_for_idle:
-                await asyncio.sleep(poll_interval_s)
-                continue
-            break
+                self._encoder_rr_index = (start + 1) % len(sorted_instances)
+                self._encoder_inflight[selected_instance] += 1
+            else:
+                selected_instance = None
 
         if selected_instance is None:
             logger.info(
@@ -927,14 +900,11 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
         selected_device = self._encoder_device.get(selected_instance, "unknown")
         logger.info(
-            "encoder dispatch route=direct selected_instance=%s selected_device=%s prefer_device=%s fallback_device=%s avoid_device=%s require_idle=%s fallback_require_idle=%s inflight=%s",
+            "encoder dispatch route=direct selected_instance=%s selected_device=%s prefer_device=%s avoid_device=%s inflight=%s",
             selected_instance,
             selected_device,
             prefer_device,
-            fallback_device,
             avoid_device,
-            require_idle,
-            fallback_require_idle,
             self._encoder_inflight.get(selected_instance, 0),
         )
 
