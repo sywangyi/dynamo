@@ -659,8 +659,8 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             multimodal_inputs=multimodal_groups,
         )
 
-        valid_encode_instances = await self._count_valid_encode_instances()
         idle_encode_instances = await self._wait_for_idle_encode_instance(request_id)
+        valid_encode_instances = await self._count_valid_encode_instances()
         if self._can_split_encode(multimodal_groups, valid_encode_instances) and (
             idle_encode_instances > 0
         ):
@@ -681,7 +681,11 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
         # Send to encoder worker using load-aware routing
         response_generator, selected_instance = await self._dispatch_to_encoder(
-            worker_request.model_dump_json()
+            worker_request.model_dump_json(),
+            prefer_device="none-cpu",
+            require_idle=True,
+            fallback_device="cpu",
+            fallback_require_idle=True,
         )
 
         # Process and yield SGLang responses
@@ -808,6 +812,8 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         prefer_device: str | None = None,
         require_idle: bool = False,
         avoid_device: str | None = None,
+        fallback_device: str | None = None,
+        fallback_require_idle: bool = False,
     ):
         """Dispatch request to encoder worker using least in-flight routing.
 
@@ -863,6 +869,20 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                         ]
                     if preferred:
                         candidate_instances = preferred
+                    elif fallback_device is not None:
+                        fallback = [
+                            instance
+                            for instance in candidate_instances
+                            if self._encoder_device.get(instance) == fallback_device
+                        ]
+                        if fallback_require_idle:
+                            fallback = [
+                                instance
+                                for instance in fallback
+                                if self._encoder_inflight.get(instance, 0) == 0
+                            ]
+                        if fallback:
+                            candidate_instances = fallback
 
                 min_inflight = min(
                     self._encoder_inflight.get(instance, 0)
@@ -887,12 +907,14 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
         selected_device = self._encoder_device.get(selected_instance, "unknown")
         logger.info(
-            "encoder dispatch route=direct selected_instance=%s selected_device=%s prefer_device=%s avoid_device=%s require_idle=%s inflight=%s",
+            "encoder dispatch route=direct selected_instance=%s selected_device=%s prefer_device=%s fallback_device=%s avoid_device=%s require_idle=%s fallback_require_idle=%s inflight=%s",
             selected_instance,
             selected_device,
             prefer_device,
+            fallback_device,
             avoid_device,
             require_idle,
+            fallback_require_idle,
             self._encoder_inflight.get(selected_instance, 0),
         )
 
