@@ -216,7 +216,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             if (
                 (
                     self._encoder_device.get(instance) == "none-cpu"
-                    and inflight_snapshot.get(instance, 0) == 0
                 )
                 or (
                     self._encoder_device.get(instance) == "cpu"
@@ -241,32 +240,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             if self._encoder_device.get(instance) in {"none-cpu", "cpu"}
             and inflight_snapshot.get(instance, 0) == 0
         )
-
-    async def _wait_for_idle_encode_instance(
-        self,
-        request_id: str,
-    ) -> int:
-        idle_encode_instances = await self._count_idle_encode_instances()
-        if idle_encode_instances > 0:
-            return idle_encode_instances
-
-        poll_interval_s = max(self.split_encode_idle_poll_interval_ms, 1) / 1000.0
-        logger.debug(
-            "split encode idle wait start: request=%s poll_interval_ms=%d",
-            request_id,
-            self.split_encode_idle_poll_interval_ms,
-        )
-
-        while idle_encode_instances == 0:
-            await asyncio.sleep(poll_interval_s)
-            idle_encode_instances = await self._count_idle_encode_instances()
-
-        logger.debug(
-            "split encode idle wait done: request=%s idle_instances=%d",
-            request_id,
-            idle_encode_instances,
-        )
-        return idle_encode_instances
 
     async def _record_request_path(self, request_id: str, path: str) -> None:
         async with self._split_metrics_lock:
@@ -467,6 +440,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                     _encode_batch(
                         subbatch,
                         prefer_device="none-cpu",
+                        require_idle=False,
                         avoid_device="cpu",
                         expected_count=len(subbatch),
                         batch_name=f"non-cpu-{i}",
@@ -684,7 +658,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             multimodal_inputs=multimodal_groups,
         )
 
-        idle_encode_instances = await self._wait_for_idle_encode_instance(request_id)
+        idle_encode_instances = await self._count_idle_encode_instances()
         valid_encode_instances = await self._count_valid_encode_instances()
         if self._can_split_encode(multimodal_groups, valid_encode_instances) and (
             idle_encode_instances > 0
@@ -711,7 +685,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         response_generator, selected_instance = await self._dispatch_to_encoder(
             worker_request.model_dump_json(),
             prefer_device="none-cpu",
-            require_idle=True,
+            require_idle=False,
             fallback_device="cpu",
             fallback_require_idle=True,
         )
