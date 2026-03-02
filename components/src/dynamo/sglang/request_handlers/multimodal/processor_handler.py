@@ -214,7 +214,10 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             1
             for instance in instances
             if (
-                self._encoder_device.get(instance) == "none-cpu"
+                (
+                    self._encoder_device.get(instance) == "none-cpu"
+                    and inflight_snapshot.get(instance, 0) == 0
+                )
                 or (
                     self._encoder_device.get(instance) == "cpu"
                     and inflight_snapshot.get(instance, 0) == 0
@@ -311,6 +314,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             instance
             for instance in instances
             if self._encoder_device.get(instance) == "none-cpu"
+            and inflight_snapshot.get(instance, 0) == 0
         ]
 
         total_images = len(multimodal_groups)
@@ -339,7 +343,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             expected_count: int,
             batch_name: str,
         ) -> tuple[list[MultiModalGroup], torch.Tensor, list[int], float]:
-            batch_start_time = time.perf_counter()
             batch_groups = [
                 MultiModalGroup(
                     multimodal_input=MultiModalInput(
@@ -362,6 +365,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 require_idle=require_idle,
                 avoid_device=avoid_device,
             )
+            batch_start_time = time.perf_counter()
             try:
                 first = await anext(response_generator)
                 payload = self._parse_response_payload(first)
