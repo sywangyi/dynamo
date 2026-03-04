@@ -290,7 +290,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             instance
             for instance in instances
             if self._encoder_device.get(instance) == "none-cpu"
-            and inflight_snapshot.get(instance, 0) == 0
         ]
 
         total_images = len(multimodal_groups)
@@ -428,6 +427,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                     _encode_batch(
                         subbatch,
                         prefer_device="cpu",
+                        avoid_device="none-cpu",
                         expected_count=len(subbatch),
                         batch_name=f"cpu-{i}",
                     )
