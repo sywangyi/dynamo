@@ -664,6 +664,7 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         # Non-split policy:
         # - If any CPU instance is idle, route by global min in-flight across CPU/non-CPU.
         # - If CPU is busy, prefer non-CPU and avoid CPU when possible.
+        no_split_start_time = time.perf_counter()
         has_idle_cpu = await self._has_idle_cpu_encode_instance()
         if has_idle_cpu:
             response_generator, selected_instance = await self._dispatch_to_encoder(
@@ -675,6 +676,10 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 prefer_device="none-cpu",
                 avoid_device="cpu",
             )
+        no_split_end_time = time.perf_counter()
+        logger.info(
+            f"No-split encode path time for request {request_id}: {no_split_end_time - no_split_start_time:.2f} seconds"
+        )
 
         # Process and yield SGLang responses
         finished_sent = False
