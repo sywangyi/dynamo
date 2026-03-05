@@ -211,23 +211,6 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             )
         )
 
-    async def _count_idle_encode_instances(self) -> int:
-        instances = self.encode_worker_client.instance_ids()
-        if not instances:
-            return 0
-
-        await self._probe_encoder_devices(instances)
-
-        async with self._encoder_route_lock:
-            inflight_snapshot = dict(self._encoder_inflight)
-
-        return sum(
-            1
-            for instance in instances
-            if self._encoder_device.get(instance) in {"none-cpu", "cpu"}
-            and inflight_snapshot.get(instance, 0) == 0
-        )
-
     async def _has_idle_cpu_encode_instance(self) -> bool:
         instances = self.encode_worker_client.instance_ids()
         if not instances:
@@ -657,11 +640,8 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
             multimodal_inputs=multimodal_groups,
         )
 
-        idle_encode_instances = await self._count_idle_encode_instances()
         valid_encode_instances = await self._count_valid_encode_instances()
-        if self._can_split_encode(multimodal_groups, valid_encode_instances) and (
-            idle_encode_instances > 0
-        ):
+        if self._can_split_encode(multimodal_groups, valid_encode_instances):
             await self._record_request_path(request_id, "split")
             try:
                 async for item in self._generate_split(
