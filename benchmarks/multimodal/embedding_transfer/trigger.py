@@ -12,7 +12,7 @@ from dynamo.runtime import DistributedRuntime, dynamo_worker
 NUM_REQUESTS = 100
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
     # Get endpoint (sender -> receiver)
     sender_endpoint = runtime.endpoint("embedding_transfer.sender.generate")

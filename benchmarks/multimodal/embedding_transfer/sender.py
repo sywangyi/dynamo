@@ -23,9 +23,11 @@ configure_dynamo_logging()
 class Sender:
     def __init__(self, runtime: DistributedRuntime):
         self.runtime = runtime
+        self.receiver_read_endpoint = None
+        self.read_client = None
         self.local_sender = LocalEmbeddingSender()
-        self.read_sender = NixlReadEmbeddingSender()
-        self.write_sender = NixlWriteEmbeddingSender()
+        self.read_sender = None
+        self.write_sender = None
         # GPU tensor to mimic encoder output
         self.cpu_tensor = torch.randn([256, 8 * 1024], dtype=torch.float16)
         self.gpu_tensor = (
@@ -42,8 +44,12 @@ class Sender:
         if self.config.transfer_type == EmbeddingTransferMode.LOCAL:
             sender = self.local_sender
         elif self.config.transfer_type == EmbeddingTransferMode.NIXL_WRITE:
+            if self.write_sender is None:
+                self.write_sender = NixlWriteEmbeddingSender()
             sender = self.write_sender
         elif self.config.transfer_type == EmbeddingTransferMode.NIXL_READ:
+            if self.read_sender is None:
+                self.read_sender = NixlReadEmbeddingSender()
             sender = self.read_sender
         else:
             raise ValueError(f"Invalid transfer type: {self.config.transfer_type}")
@@ -55,8 +61,11 @@ class Sender:
         self.receiver_read_endpoint = self.runtime.endpoint(
             "embedding_transfer.receiver.read"
         )
-        self.read_client = await self.receiver_read_endpoint.client()
-        # await self.read_client.wait_for_instances()
+
+    async def _get_read_client(self):
+        if self.read_client is None:
+            self.read_client = await self.receiver_read_endpoint.client()
+        return self.read_client
 
     async def generate(self, request: str):
         # Select the variant of sender/receiver based on config
@@ -70,7 +79,8 @@ class Sender:
             )
             request.requests.append(transfer_request)
             futures.append(send_future)
-        stream = await self.read_client.round_robin(request.model_dump_json())
+        read_client = await self._get_read_client()
+        stream = await read_client.round_robin(request.model_dump_json())
         async for response in stream:
             continue
         await asyncio.gather(*futures)
@@ -97,7 +107,7 @@ class Sender:
         yield "config updated"
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
     namespace_name = "embedding_transfer"
     component_name = "sender"

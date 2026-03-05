@@ -22,11 +22,11 @@ configure_dynamo_logging()
 class Receiver:
     def __init__(self, runtime: DistributedRuntime):
         self.runtime = runtime
+        self.sender_write_endpoint = None
+        self.send_client = None
         self.local_receiver = LocalEmbeddingReceiver()
-        self.write_receiver = NixlWriteEmbeddingReceiver(2 * 8 * 1024 * 256 * 1024 * 3)
-        self.read_receiver = NixlReadEmbeddingReceiver(
-            embedding_hidden_size=8 * 1024, max_item_mm_token=1024
-        )
+        self.write_receiver = None
+        self.read_receiver = None
         self.config = TransferConfig()
 
     def get_run_config(self):
@@ -34,8 +34,16 @@ class Receiver:
         if self.config.transfer_type == EmbeddingTransferMode.LOCAL:
             receiver = self.local_receiver
         elif self.config.transfer_type == EmbeddingTransferMode.NIXL_WRITE:
+            if self.write_receiver is None:
+                self.write_receiver = NixlWriteEmbeddingReceiver(
+                    2 * 8 * 1024 * 256 * 1024 * 3
+                )
             receiver = self.write_receiver
         elif self.config.transfer_type == EmbeddingTransferMode.NIXL_READ:
+            if self.read_receiver is None:
+                self.read_receiver = NixlReadEmbeddingReceiver(
+                    embedding_hidden_size=8 * 1024, max_item_mm_token=1024
+                )
             receiver = self.read_receiver
         else:
             raise ValueError(f"Invalid transfer type: {self.config.transfer_type}")
@@ -47,8 +55,11 @@ class Receiver:
         self.sender_write_endpoint = self.runtime.endpoint(
             "embedding_transfer.sender.write"
         )
-        self.send_client = await self.sender_write_endpoint.client()
-        # await self.send_client.wait_for_instances()
+
+    async def _get_send_client(self):
+        if self.send_client is None:
+            self.send_client = await self.sender_write_endpoint.client()
+        return self.send_client
 
     async def batch_receive(self, batch_transfer_request: BatchTransferRequest):
         receiver = self.get_run_config()
@@ -68,7 +79,8 @@ class Receiver:
             raise first_error
 
     async def generate(self, request):
-        stream = await self.send_client.round_robin("send_request")
+        send_client = await self._get_send_client()
+        stream = await send_client.round_robin("send_request")
         async for response in stream:
             await self.batch_receive(
                 BatchTransferRequest.model_validate_json(response.data())
@@ -85,7 +97,7 @@ class Receiver:
         yield "config updated"
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
     namespace_name = "embedding_transfer"
     component_name = "receiver"
