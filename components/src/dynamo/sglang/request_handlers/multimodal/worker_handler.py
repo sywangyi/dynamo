@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import AsyncIterator, Optional
 
 import sglang as sgl
@@ -113,10 +114,27 @@ class EmbeddingsProcessor:
             )
             self._connector = connect.Connector()
 
+        process_start_time = time.perf_counter()
+        begin_read_start_time = time.perf_counter()
         read_op = await self._connector.begin_read(serialized_request, descriptor)
-        await read_op.wait_for_completion()
+        begin_read_done_time = time.perf_counter()
 
-        return embeddings, descriptor
+        wait_start_time = time.perf_counter()
+        await read_op.wait_for_completion()
+        wait_done_time = time.perf_counter()
+
+        timings = {
+            "process_start_time": process_start_time,
+            "begin_read_start_time": begin_read_start_time,
+            "begin_read_done_time": begin_read_done_time,
+            "wait_start_time": wait_start_time,
+            "wait_done_time": wait_done_time,
+            "begin_read_ms": (begin_read_done_time - begin_read_start_time) * 1000.0,
+            "wait_ms": (wait_done_time - wait_start_time) * 1000.0,
+            "transfer_total_ms": (wait_done_time - begin_read_start_time) * 1000.0,
+        }
+
+        return embeddings, descriptor, timings
 
     @staticmethod
     def create_multimodal_item(embeddings: torch.Tensor, image_grid_thw) -> dict:
@@ -246,9 +264,11 @@ class ErrorResponseBuilder:
 
 async def _build_mm_items(
     request: SglangMultimodalRequest, embeddings_processor: EmbeddingsProcessor
-) -> tuple[list[dict], torch.Tensor]:
+) -> tuple[list[dict], torch.Tensor, dict[str, float]]:
     """Process embeddings and build a single multimodal item for SGLang."""
-    embeddings, _ = await embeddings_processor.process_embeddings(request)
+    embeddings, _, transfer_timings = await embeddings_processor.process_embeddings(
+        request
+    )
 
     image_grid_thw_list = [group.image_grid_thw for group in request.multimodal_inputs]
     if any(item is None for item in image_grid_thw_list):
@@ -258,7 +278,7 @@ async def _build_mm_items(
         embeddings_processor.create_multimodal_item(embeddings, image_grid_thw_list)
     ]
 
-    return mm_items, embeddings
+    return mm_items, embeddings, transfer_timings
 
 
 class MultimodalWorkerHandler(BaseWorkerHandler):
@@ -317,6 +337,9 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
             request: Multimodal request with input and parameters.
             context: Context object for cancellation handling.
         """
+        request_start_time = time.perf_counter()
+        diag_request_id = context.id() if hasattr(context, "id") else "unknown"
+
         try:
             request = self._validate_and_parse_request(request)
 
@@ -325,7 +348,9 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
                 async for output in self._generate_disaggregated(request):
                     yield output
             else:
-                async for output in self._generate_aggregated(request):
+                async for output in self._generate_aggregated(
+                    request, diag_request_id, request_start_time
+                ):
                     yield output
 
         except Exception as e:
@@ -361,18 +386,38 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
             yield output
 
     async def _generate_aggregated(
-        self, request: SglangMultimodalRequest
+        self,
+        request: SglangMultimodalRequest,
+        diag_request_id: str,
+        request_start_time: float,
     ) -> AsyncIterator[str]:
         """Handle aggregated mode generation"""
         input_ids = request.request.token_ids
         if not input_ids:
             raise ValueError("input_ids is required")
 
+        begin_read_start_delay_ms = -1.0
+        begin_read_ms = -1.0
+        nixl_wait_ms = -1.0
+        transfer_total_ms = -1.0
+        sglang_dispatch_ms = -1.0
+        first_output_ms = -1.0
+        output_chunks = 0
+        finished_ok = False
+
         try:
             sampling_params = SglangUtils.build_sampling_params(request)
-            mm_items, combined_embeddings = await _build_mm_items(
+            mm_items, combined_embeddings, transfer_timings = await _build_mm_items(
                 request, self.embeddings_processor
             )
+
+            begin_read_start_delay_ms = (
+                (transfer_timings["begin_read_start_time"] - request_start_time)
+                * 1000.0
+            )
+            begin_read_ms = transfer_timings["begin_read_ms"]
+            nixl_wait_ms = transfer_timings["wait_ms"]
+            transfer_total_ms = transfer_timings["transfer_total_ms"]
 
             logger.debug(
                 "Generated combined multimodal item with embeddings shape: "
@@ -380,15 +425,26 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
             )
             logger.debug(f"Input token sequence length: {len(input_ids)}")
 
+            sglang_dispatch_start_time = time.perf_counter()
             agg_stream = await self.engine.async_generate(
                 input_ids=input_ids,
                 image_data=mm_items,
                 sampling_params=sampling_params,
                 stream=True,
             )
+            sglang_dispatch_ms = (
+                (time.perf_counter() - sglang_dispatch_start_time) * 1000.0
+            )
 
             async for output in StreamProcessor.process_sglang_stream(agg_stream):
+                output_chunks += 1
+                if first_output_ms < 0.0:
+                    first_output_ms = (
+                        (time.perf_counter() - request_start_time) * 1000.0
+                    )
                 yield output
+
+            finished_ok = True
 
         except RuntimeError as e:
             if "shape mismatch" in str(e):
@@ -408,6 +464,21 @@ class MultimodalWorkerHandler(BaseWorkerHandler):
                 yield ErrorResponseBuilder.build_error_response(RuntimeError(error_msg))
             else:
                 yield ErrorResponseBuilder.build_error_response(e)
+        finally:
+            total_ms = (time.perf_counter() - request_start_time) * 1000.0
+            logger.info(
+                "pd worker diagnostics: request=%s mode=aggregated begin_read_start_delay_ms=%.2f begin_read_ms=%.2f nixl_wait_ms=%.2f transfer_total_ms=%.2f sglang_dispatch_ms=%.2f first_output_ms=%.2f output_chunks=%d total_ms=%.2f finished=%s",
+                diag_request_id,
+                begin_read_start_delay_ms,
+                begin_read_ms,
+                nixl_wait_ms,
+                transfer_total_ms,
+                sglang_dispatch_ms,
+                first_output_ms,
+                output_chunks,
+                total_ms,
+                finished_ok,
+            )
 
     async def _get_bootstrap_from_prefill(
         self, request: SglangMultimodalRequest, sampling_params: dict
@@ -479,6 +550,8 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
             context: Context object for cancellation handling.
         """
         bootstrap_room = None
+        request_start_time = time.perf_counter()
+        diag_request_id = context.id() if hasattr(context, "id") else "unknown"
         try:
             # Validate and parse request
             disagg_request = self._validate_and_parse_disagg_request(disagg_request)
@@ -494,7 +567,12 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
             yield bootstrap_info
 
             # Process prefill generation
-            await self._process_prefill_generation(disagg_request, bootstrap_room)
+            await self._process_prefill_generation(
+                disagg_request,
+                bootstrap_room,
+                diag_request_id,
+                request_start_time,
+            )
 
         except Exception as e:
             logger.error(f"Error in prefill generation: {e}", exc_info=True)
@@ -519,7 +597,11 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
         return disagg_request
 
     async def _process_prefill_generation(
-        self, disagg_request: DisaggSglangMultimodalRequest, bootstrap_room: int
+        self,
+        disagg_request: DisaggSglangMultimodalRequest,
+        bootstrap_room: int,
+        diag_request_id: str,
+        request_start_time: float,
     ):
         """Process multimodal input and start prefill generation"""
         # Get the SglangMultimodalRequest from the DisaggSglangMultimodalRequest
@@ -528,9 +610,19 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
         sampling_params = disagg_request.sampling_params
 
         # Process embeddings from encode worker using our embeddings processor
-        mm_items, _ = await _build_mm_items(request, self.embeddings_processor)
+        mm_items, _, transfer_timings = await _build_mm_items(
+            request, self.embeddings_processor
+        )
+
+        begin_read_start_delay_ms = (
+            (transfer_timings["begin_read_start_time"] - request_start_time) * 1000.0
+        )
+        begin_read_ms = transfer_timings["begin_read_ms"]
+        nixl_wait_ms = transfer_timings["wait_ms"]
+        transfer_total_ms = transfer_timings["transfer_total_ms"]
 
         # Start SGLang prefill generation (like regular SGLang)
+        sglang_dispatch_start_time = time.perf_counter()
         results = await self.engine.async_generate(
             input_ids=input_ids,
             image_data=mm_items,
@@ -539,6 +631,19 @@ class MultimodalPrefillWorkerHandler(BaseWorkerHandler):
             bootstrap_host=self.bootstrap_host,
             bootstrap_port=self.bootstrap_port,
             bootstrap_room=bootstrap_room,
+        )
+        sglang_dispatch_ms = (time.perf_counter() - sglang_dispatch_start_time) * 1000.0
+
+        total_ms = (time.perf_counter() - request_start_time) * 1000.0
+        logger.info(
+            "pd worker diagnostics: request=%s mode=prefill begin_read_start_delay_ms=%.2f begin_read_ms=%.2f nixl_wait_ms=%.2f transfer_total_ms=%.2f sglang_dispatch_ms=%.2f total_ms=%.2f",
+            diag_request_id,
+            begin_read_start_delay_ms,
+            begin_read_ms,
+            nixl_wait_ms,
+            transfer_total_ms,
+            sglang_dispatch_ms,
+            total_ms,
         )
 
         # Consume results without yielding (prefill doesn't return text, just coordinates)

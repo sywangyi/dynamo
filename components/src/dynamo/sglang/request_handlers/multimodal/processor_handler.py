@@ -486,7 +486,14 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
 
             finished_sent = False
             accumulated_text = ""
+            first_upstream_chunk_time: float | None = None
+            first_output_chunk_time: float | None = None
+            upstream_chunk_count = 0
+            output_chunk_count = 0
             async for resp in response_generator:
+                upstream_chunk_count += 1
+                if first_upstream_chunk_time is None:
+                    first_upstream_chunk_time = time.perf_counter()
                 try:
                     raw_data = self._parse_response_payload(resp)
                     if isinstance(raw_data, str):
@@ -545,6 +552,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                                 else 0,
                             }
 
+                        if first_output_chunk_time is None:
+                            first_output_chunk_time = time.perf_counter()
+                        output_chunk_count += 1
                         yield response_json
 
                         if is_finished:
@@ -569,7 +579,32 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                             }
                         ],
                     }
+                    if first_output_chunk_time is None:
+                        first_output_chunk_time = time.perf_counter()
+                    output_chunk_count += 1
                     break
+
+            split_total_ms = (time.perf_counter() - split_start_time) * 1000.0
+            split_first_upstream_chunk_ms = (
+                (first_upstream_chunk_time - split_start_time) * 1000.0
+                if first_upstream_chunk_time is not None
+                else -1.0
+            )
+            split_first_output_chunk_ms = (
+                (first_output_chunk_time - split_start_time) * 1000.0
+                if first_output_chunk_time is not None
+                else -1.0
+            )
+            logger.info(
+                "split path metrics: request=%s first_upstream_chunk_ms=%.2f first_output_chunk_ms=%.2f total_ms=%.2f upstream_chunks=%d output_chunks=%d finished=%s",
+                request_id,
+                split_first_upstream_chunk_ms,
+                split_first_output_chunk_ms,
+                split_total_ms,
+                upstream_chunk_count,
+                output_chunk_count,
+                finished_sent,
+            )
 
             await readable.wait_for_completion()
 
@@ -664,8 +699,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
         # Non-split policy:
         # - If any CPU instance is idle, route by global min in-flight across CPU/non-CPU.
         # - If CPU is busy, prefer non-CPU and avoid CPU when possible.
-        no_split_start_time = time.perf_counter()
+        single_path_start_time = time.perf_counter()
         has_idle_cpu = await self._has_idle_cpu_encode_instance()
+        dispatch_start_time = time.perf_counter()
         if has_idle_cpu:
             response_generator, selected_instance = await self._dispatch_to_encoder(
                 worker_request.model_dump_json()
@@ -676,17 +712,26 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                 prefer_device="none-cpu",
                 avoid_device="cpu",
             )
-        no_split_end_time = time.perf_counter()
-        logger.info(
-            f"No-split encode path time for request {request_id}: {no_split_end_time - no_split_start_time:.2f} seconds"
+        dispatch_latency_ms = (time.perf_counter() - dispatch_start_time) * 1000.0
+        selected_device = (
+            self._encoder_device.get(selected_instance, "unknown")
+            if selected_instance is not None
+            else "unknown"
         )
 
         # Process and yield SGLang responses
         finished_sent = False
         accumulated_text = ""
+        first_upstream_chunk_time: float | None = None
+        first_output_chunk_time: float | None = None
+        upstream_chunk_count = 0
+        output_chunk_count = 0
 
         try:
             async for resp in response_generator:
+                upstream_chunk_count += 1
+                if first_upstream_chunk_time is None:
+                    first_upstream_chunk_time = time.perf_counter()
                 try:
                     # Handle Annotated response objects from Dynamo (like vLLM pattern but for SGLang)
                     if hasattr(resp, "data"):
@@ -768,6 +813,9 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                                 else 0,
                             }
 
+                        if first_output_chunk_time is None:
+                            first_output_chunk_time = time.perf_counter()
+                        output_chunk_count += 1
                         yield response_json
 
                         if is_finished:
@@ -792,9 +840,37 @@ class MultimodalProcessorHandler(BaseGenerativeHandler):
                             }
                         ],
                     }
+                    if first_output_chunk_time is None:
+                        first_output_chunk_time = time.perf_counter()
+                    output_chunk_count += 1
                     yield error_response
                     break
         finally:
+            total_latency_ms = (time.perf_counter() - single_path_start_time) * 1000.0
+            first_upstream_chunk_ms = (
+                (first_upstream_chunk_time - single_path_start_time) * 1000.0
+                if first_upstream_chunk_time is not None
+                else -1.0
+            )
+            first_output_chunk_ms = (
+                (first_output_chunk_time - single_path_start_time) * 1000.0
+                if first_output_chunk_time is not None
+                else -1.0
+            )
+            logger.info(
+                "single encode path metrics: request=%s selected_instance=%s selected_device=%s has_idle_cpu=%s dispatch_ms=%.2f first_upstream_chunk_ms=%.2f first_output_chunk_ms=%.2f total_ms=%.2f upstream_chunks=%d output_chunks=%d finished=%s",
+                request_id,
+                selected_instance,
+                selected_device,
+                has_idle_cpu,
+                dispatch_latency_ms,
+                first_upstream_chunk_ms,
+                first_output_chunk_ms,
+                total_latency_ms,
+                upstream_chunk_count,
+                output_chunk_count,
+                finished_sent,
+            )
             if selected_instance is not None:
                 await self._on_encoder_request_done(selected_instance)
 

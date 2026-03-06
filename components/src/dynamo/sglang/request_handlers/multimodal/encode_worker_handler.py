@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import AsyncIterator, Optional
 
 import torch
@@ -143,9 +144,12 @@ class MultimodalEncodeWorkerHandler(BaseGenerativeHandler):
         # 5. Stream the downstream worker's response back to the caller.
 
         try:
+            path_start_time = time.perf_counter()
+            diag_request_id = context.id() if hasattr(context, "id") else "unknown"
             multimodal_groups = request.multimodal_inputs
             if not multimodal_groups:
                 raise ValueError("multimodal_inputs is required for the encode worker.")
+            image_count = len(multimodal_groups)
 
             image_urls = []
             for idx, mm_group in enumerate(multimodal_groups):
@@ -160,9 +164,12 @@ class MultimodalEncodeWorkerHandler(BaseGenerativeHandler):
                     )
                 image_urls.append(mm_input.image_url)
 
+            encode_start_time = time.perf_counter()
             image_grid_dim, precomputed_embeddings = await self.encoder._encode(
                 image_urls
             )
+            encode_latency_ms = (time.perf_counter() - encode_start_time) * 1000.0
+            prepare_start_time = time.perf_counter()
 
             image_grid_thw_list = (
                 image_grid_dim.tolist()
@@ -265,26 +272,90 @@ class MultimodalEncodeWorkerHandler(BaseGenerativeHandler):
                     )
                     search_start = image_token_id_index + num_image_tokens
 
+            prepare_latency_ms = (time.perf_counter() - prepare_start_time) * 1000.0
+            sglang_encode_ms = encode_latency_ms
+
             descriptor = connect.Descriptor(precomputed_embeddings)
+            nixl_open_start_time = time.perf_counter()
             with await self._connector.create_readable(descriptor) as readable:
+                nixl_open_latency_ms = (
+                    (time.perf_counter() - nixl_open_start_time) * 1000.0
+                )
                 request.serialized_request = readable.metadata()
                 logger.debug(f"Request: {request.model_dump_json()}")
 
                 if request.encode_only:
                     yield request.model_dump_json()
+
+                    readable_wait_start_time = time.perf_counter()
                     await readable.wait_for_completion()
+                    readable_wait_latency_ms = (
+                        (time.perf_counter() - readable_wait_start_time) * 1000.0
+                    )
+
+                    total_latency_ms = (time.perf_counter() - path_start_time) * 1000.0
+                    logger.info(
+                        "encode worker diagnostics: request=%s mode=encode_only device=%s images=%d sglang_encode_ms=%.2f prepare_ms=%.2f nixl_open_ms=%.2f readable_wait_ms=%.2f total_ms=%.2f",
+                        diag_request_id,
+                        _get_reported_device(),
+                        image_count,
+                        sglang_encode_ms,
+                        prepare_latency_ms,
+                        nixl_open_latency_ms,
+                        readable_wait_latency_ms,
+                        total_latency_ms,
+                    )
                     return
 
                 # Get the response generator from downstream worker
+                pd_handoff_start_time = time.perf_counter()
+                pd_dispatch_start_time = time.perf_counter()
                 response_generator = await self.pd_worker_client.round_robin(
                     request.model_dump_json()
                 )
+                pd_dispatch_latency_ms = (
+                    (time.perf_counter() - pd_dispatch_start_time) * 1000.0
+                )
+
+                readable_wait_start_time = time.perf_counter()
                 await readable.wait_for_completion()
+                readable_wait_latency_ms = (
+                    (time.perf_counter() - readable_wait_start_time) * 1000.0
+                )
+                pd_handoff_ms = (time.perf_counter() - pd_handoff_start_time) * 1000.0
+
+                first_downstream_chunk_time: float | None = None
+                downstream_chunk_count = 0
 
                 async for response in response_generator:
+                    downstream_chunk_count += 1
+                    if first_downstream_chunk_time is None:
+                        first_downstream_chunk_time = time.perf_counter()
                     yield response.data() if hasattr(response, "data") else str(
                         response
                     )
+
+                first_downstream_chunk_ms = (
+                    (first_downstream_chunk_time - path_start_time) * 1000.0
+                    if first_downstream_chunk_time is not None
+                    else -1.0
+                )
+                total_latency_ms = (time.perf_counter() - path_start_time) * 1000.0
+                logger.info(
+                    "encode worker diagnostics: request=%s mode=full device=%s images=%d sglang_encode_ms=%.2f pd_handoff_ms=%.2f prepare_ms=%.2f nixl_open_ms=%.2f pd_dispatch_ms=%.2f readable_wait_ms=%.2f first_downstream_chunk_ms=%.2f downstream_chunks=%d total_ms=%.2f",
+                    diag_request_id,
+                    _get_reported_device(),
+                    image_count,
+                    sglang_encode_ms,
+                    pd_handoff_ms,
+                    prepare_latency_ms,
+                    nixl_open_latency_ms,
+                    pd_dispatch_latency_ms,
+                    readable_wait_latency_ms,
+                    first_downstream_chunk_ms,
+                    downstream_chunk_count,
+                    total_latency_ms,
+                )
 
         except Exception as e:
             logger.error(f"Error processing request: {e}")
