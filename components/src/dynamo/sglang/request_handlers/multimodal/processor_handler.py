@@ -138,114 +138,115 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
         finished_sent = False
         accumulated_text = ""
 
-        async for resp in response_generator:
-            try:
-                # Handle Annotated response objects from Dynamo (like vLLM pattern but for SGLang)
-                if hasattr(resp, "data"):
-                    # Extract data from Dynamo Annotated response
-                    raw_data = resp.data
-                    if callable(raw_data):
-                        raw_data = raw_data()
+        try:
+            async for resp in response_generator:
+                try:
+                    # Handle Annotated response objects from Dynamo (like vLLM pattern but for SGLang)
+                    if hasattr(resp, "data"):
+                        # Extract data from Dynamo Annotated response
+                        raw_data = resp.data
+                        if callable(raw_data):
+                            raw_data = raw_data()
 
-                    if isinstance(raw_data, str):
+                        if isinstance(raw_data, str):
+                            try:
+                                response_data = json.loads(raw_data)
+                            except json.JSONDecodeError:
+                                response_data = {"text": raw_data, "finished": False}
+                        else:
+                            response_data = raw_data
+                    elif isinstance(resp, str):
                         try:
-                            response_data = json.loads(raw_data)
+                            response_data = json.loads(resp)
                         except json.JSONDecodeError:
-                            response_data = {"text": raw_data, "finished": False}
+                            response_data = {"text": resp, "finished": False}
                     else:
-                        response_data = raw_data
-                elif isinstance(resp, str):
-                    try:
-                        response_data = json.loads(resp)
-                    except json.JSONDecodeError:
-                        response_data = {"text": resp, "finished": False}
-                else:
-                    response_data = resp
+                        response_data = resp
 
-                # Use SGLang chat_processor for detokenization
-                (
-                    text_content,
-                    accumulated_text,
-                    is_finished,
-                ) = process_sglang_stream_response(
-                    response_data, self.tokenizer, accumulated_text
-                )
+                    # Use SGLang chat_processor for detokenization
+                    (
+                        text_content,
+                        accumulated_text,
+                        is_finished,
+                    ) = process_sglang_stream_response(
+                        response_data, self.tokenizer, accumulated_text
+                    )
 
-                # Create OpenAI-compatible response (following vLLM-like pattern but for SGLang)
-                if text_content or is_finished:
-                    choice: Dict[str, Any] = {
-                        "index": 0,
-                        "delta": {},
-                        "finish_reason": None,
-                    }
-                    delta: Dict[str, str] = choice["delta"]  # Type-safe access
+                    # Create OpenAI-compatible response (following vLLM-like pattern but for SGLang)
+                    if text_content or is_finished:
+                        choice: Dict[str, Any] = {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": None,
+                        }
+                        delta: Dict[str, str] = choice["delta"]  # Type-safe access
 
-                    # Add role for first message or when there's content
-                    if text_content and not finished_sent:
-                        delta["role"] = "assistant"
-
-                    # Add content if available
-                    if text_content:
-                        delta["content"] = text_content
-
-                    # Set finish reason if completed
-                    if is_finished:
-                        choice["finish_reason"] = response_data.get(
-                            "finish_reason", "stop"
-                        )
-                        if not finished_sent and not text_content:
-                            # Final chunk needs role if it's the first chunk
+                        # Add role for first message or when there's content
+                        if text_content and not finished_sent:
                             delta["role"] = "assistant"
 
-                    response_json = {
+                        # Add content if available
+                        if text_content:
+                            delta["content"] = text_content
+
+                        # Set finish reason if completed
+                        if is_finished:
+                            choice["finish_reason"] = response_data.get(
+                                "finish_reason", "stop"
+                            )
+                            if not finished_sent and not text_content:
+                                # Final chunk needs role if it's the first chunk
+                                delta["role"] = "assistant"
+
+                        response_json = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": self.model,
+                            "choices": [choice],
+                        }
+
+                        # Add usage only for final response
+                        if is_finished:
+                            response_json["usage"] = {
+                                "prompt_tokens": 0,
+                                "completion_tokens": len(accumulated_text.split())
+                                if accumulated_text
+                                else 0,
+                                "total_tokens": len(accumulated_text.split())
+                                if accumulated_text
+                                else 0,
+                            }
+
+                        yield response_json
+
+                        if is_finished:
+                            finished_sent = True
+                            break
+
+                except Exception as e:
+                    logger.error(f"Error processing SGLang response: {e}")
+                    error_response = {
                         "id": f"chatcmpl-{request_id}",
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": self.model,
-                        "choices": [choice],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": f"Error: {str(e)}",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
                     }
-
-                    # Add usage only for final response
-                    if is_finished:
-                        response_json["usage"] = {
-                            "prompt_tokens": 0,
-                            "completion_tokens": len(accumulated_text.split())
-                            if accumulated_text
-                            else 0,
-                            "total_tokens": len(accumulated_text.split())
-                            if accumulated_text
-                            else 0,
-                        }
-
-                    yield response_json
-
-                    if is_finished:
-                        finished_sent = True
-                        break
-
-            except Exception as e:
-                logger.error(f"Error processing SGLang response: {e}")
-                error_response = {
-                    "id": f"chatcmpl-{request_id}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": self.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": f"Error: {str(e)}",
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield error_response
-                break
-            finally:
-                if selected_instance is not None:
-                    await self._on_encoder_request_done(selected_instance)
+                    yield error_response
+                    break
+        finally:
+            if selected_instance is not None:
+                await self._on_encoder_request_done(selected_instance)
 
     async def _dispatch_to_encoder(
         self,
