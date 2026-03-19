@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -46,9 +47,31 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
         self.model = config.server_args.model_path
         self._encoder_inflight: dict[int, int] = defaultdict(int)
         self._encoder_device: dict[int, str] = {}
+        self._encoder_request_instance: dict[str, int] = {}
         self._encoder_route_lock = asyncio.Lock()
         self._encoder_probe_lock = asyncio.Lock()
         self._encoder_rr_index = 0
+        # Number of CUDA in-flight requests required before 1 CPU slot is allowed.
+        # E.g. ratio=8 means: allowed_cpu_inflight = total_cuda_inflight // 8.
+        # Can be configured via DYN_SGL_MULTIMODAL_CUDA_TO_CPU_RATIO.
+        configured_ratio = os.environ.get("DYN_SGL_MULTIMODAL_CUDA_TO_CPU_RATIO", 8)
+        try:
+            parsed_ratio = int(configured_ratio)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid multimodal CUDA:CPU ratio %r; falling back to 8",
+                configured_ratio,
+            )
+            parsed_ratio = 8
+
+        if parsed_ratio < 1:
+            logger.warning(
+                "multimodal CUDA:CPU ratio must be >= 1, got %s; falling back to 8",
+                parsed_ratio,
+            )
+            parsed_ratio = 8
+
+        self._cuda_to_cpu_ratio: int = parsed_ratio
 
         # Initialize tokenizer for the model
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -130,8 +153,8 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
         )
 
         # Send to encoder worker using heterogeneous device policy.
-        response_generator, selected_instance = await self._dispatch_to_encoder(
-            worker_request.model_dump_json()
+        response_generator, _ = await self._dispatch_to_encoder(
+            worker_request.model_dump_json(), request_id
         )
 
         # Process and yield SGLang responses
@@ -245,12 +268,12 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                     yield error_response
                     break
         finally:
-            if selected_instance is not None:
-                await self._on_encoder_request_done(selected_instance)
+            await self._on_encoder_request_done(request_id)
 
     async def _dispatch_to_encoder(
         self,
         payload: str,
+        request_id: str,
     ):
         """Dispatch request to encoder worker using least in-flight routing.
 
@@ -283,10 +306,16 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                 tie_break_order = sorted_instances[start:] + sorted_instances[:start]
 
                 candidate_instances = tie_break_order
-                # Default heterogeneous policy:
-                # 1) CPU and non-CPU both idle -> choose non-CPU
-                # 2) CPU idle and non-CPU busy -> choose CPU
-                # 3) When choosing non-CPU, pick lowest in-flight non-CPU
+                # Ratio-based heterogeneous policy (CUDA : CPU = _cuda_to_cpu_ratio : 1)
+                # interpreted per instance. Effective total allowance scales with
+                # instance counts:
+                # allowed_cpu_inflight = floor(
+                #   total_cuda_inflight * cpu_instance_count
+                #   / (_cuda_to_cpu_ratio * cuda_instance_count)
+                # )
+                # Route to CPU only when current cpu inflight < allowed_cpu_inflight,
+                # otherwise route to CUDA (non-cpu). Falls back to the available
+                # device type when only one type is present.
                 cpu_instances = [
                     instance
                     for instance in tie_break_order
@@ -298,25 +327,22 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                     if self._encoder_device.get(instance) == "none-cpu"
                 ]
 
-                idle_cpu_instances = [
-                    instance
-                    for instance in cpu_instances
-                    if self._encoder_inflight.get(instance, 0) == 0
-                ]
-                idle_non_cpu_instances = [
-                    instance
-                    for instance in non_cpu_instances
-                    if self._encoder_inflight.get(instance, 0) == 0
-                ]
-
-                if idle_cpu_instances and idle_non_cpu_instances:
-                    candidate_instances = non_cpu_instances
-                elif (
-                    idle_cpu_instances
-                    and non_cpu_instances
-                    and not idle_non_cpu_instances
-                ):
-                    candidate_instances = cpu_instances
+                if non_cpu_instances and cpu_instances:
+                    total_cuda_inflight = sum(
+                        self._encoder_inflight.get(i, 0) for i in non_cpu_instances
+                    )
+                    total_cpu_inflight = sum(
+                        self._encoder_inflight.get(i, 0) for i in cpu_instances
+                    )
+                    allowed_cpu_inflight = (
+                        total_cuda_inflight
+                        * len(cpu_instances)
+                        // (self._cuda_to_cpu_ratio * len(non_cpu_instances))
+                    )
+                    if total_cpu_inflight < allowed_cpu_inflight:
+                        candidate_instances = cpu_instances
+                    else:
+                        candidate_instances = non_cpu_instances
                 elif non_cpu_instances:
                     candidate_instances = non_cpu_instances
                 elif cpu_instances:
@@ -337,6 +363,7 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
 
                 self._encoder_rr_index = (start + 1) % len(sorted_instances)
                 self._encoder_inflight[selected_instance] += 1
+                self._encoder_request_instance[request_id] = selected_instance
                 selected_inflight = self._encoder_inflight[selected_instance]
             else:
                 selected_instance = None
@@ -367,12 +394,15 @@ class MultimodalProcessorHandler(BaseWorkerHandler):
                 selected_instance,
                 selected_device,
             )
-            await self._on_encoder_request_done(selected_instance)
+            await self._on_encoder_request_done(request_id)
             return await self.encode_worker_client.round_robin(payload), None
 
-    async def _on_encoder_request_done(self, instance_id: int) -> None:
+    async def _on_encoder_request_done(self, request_id: str) -> None:
         """Mark completion of an encoder request for in-flight accounting."""
         async with self._encoder_route_lock:
+            instance_id = self._encoder_request_instance.pop(request_id, None)
+            if instance_id is None:
+                return
             in_flight = self._encoder_inflight.get(instance_id, 0)
             if in_flight <= 1:
                 self._encoder_inflight[instance_id] = 0
