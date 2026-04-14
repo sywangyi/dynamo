@@ -103,30 +103,19 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             .image_token
         )
 
-        # For Qwen2.5-VL, the image token might be multiple tokens
-        if image_token_str == "<|vision_start|><|image_pad|><|vision_end|>":
-            # These are likely the individual special tokens for Qwen2.5-VL
-            image_pad_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
-            assert isinstance(
-                image_pad_id, int
-            ), f"Expected int token id, got {type(image_pad_id)}"
-
-            # Use the image_pad token as the main image token
-            self.image_token_id: int = image_pad_id
-        else:
-            # Fallback for other models
-            token_id = self.tokenizer.convert_tokens_to_ids(image_token_str)
-            assert isinstance(
-                token_id, int
-            ), f"Expected int token id, got {type(token_id)}"
-            self.image_token_id = token_id
+        image_token_id = self._resolve_mm_token_id(
+            image_token_str, preferred_token="<|image_pad|>"
+        )
+        if image_token_id is None:
+            raise ValueError("image token is not defined in chat template")
+        self.image_token_id = image_token_id
 
         template = chat_templates[getattr(config.server_args, "chat_template")].copy()
         self.video_token_id: Optional[int] = self._resolve_mm_token_id(
-            getattr(template, "video_token", None)
+            getattr(template, "video_token", None), preferred_token="<|video_pad|>"
         )
         self.audio_token_id: Optional[int] = self._resolve_mm_token_id(
-            getattr(template, "audio_token", None)
+            getattr(template, "audio_token", None), preferred_token="<|audio_pad|>"
         )
 
         self.min_workers = 1
@@ -157,11 +146,32 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         """Stable blake2b hash of an image URL, used as embedding cache key."""
         return hashlib.blake2b(url.encode(), digest_size=32).hexdigest()
 
-    def _resolve_mm_token_id(self, token_str: Optional[str]) -> Optional[int]:
+    def _resolve_mm_token_id(
+        self, token_str: Optional[str], preferred_token: Optional[str] = None
+    ) -> Optional[int]:
         if not token_str:
             return None
+
         token_id = self.tokenizer.convert_tokens_to_ids(token_str)
-        return token_id if isinstance(token_id, int) and token_id >= 0 else None
+        if isinstance(token_id, int) and token_id >= 0:
+            return token_id
+
+        # For templates like qwen2-vl, modality placeholders are composite
+        # strings and need to be resolved to inner pad-token IDs.
+        candidates: list[str] = []
+        if preferred_token:
+            candidates.append(preferred_token)
+
+        for marker in ("<|image_pad|>", "<|video_pad|>", "<|audio_pad|>", "<|AUDIO|>"):
+            if marker in token_str and marker not in candidates:
+                candidates.append(marker)
+
+        for candidate in candidates:
+            candidate_id = self.tokenizer.convert_tokens_to_ids(candidate)
+            if isinstance(candidate_id, int) and candidate_id >= 0:
+                return candidate_id
+
+        return None
 
     @staticmethod
     def _grid_units(grid_item: Any, modality: str) -> int:
@@ -465,7 +475,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             ) in modality_specs:
                 if not urls:
                     continue
-
                 if token_id is None:
                     raise ValueError(
                         f"{modality_name.lower()} token is not defined in chat template"
