@@ -127,9 +127,6 @@ class EmbeddingsProcessor:
         elif modality == "VIDEO":
             grid_key = "video_grid_thw"
             grid_payload = torch.tensor(grid_values)
-        elif modality == "AUDIO":
-            grid_key = "audio_feature_lens_raw"
-            grid_payload = torch.tensor(grid_values)
         else:
             raise ValueError(
                 f"Unsupported modality for precomputed mm_item: {modality}"
@@ -254,16 +251,14 @@ class ErrorResponseBuilder:
 
 async def _build_mm_items(
     request: SglangMultimodalRequest, embeddings_processor: EmbeddingsProcessor
-) -> tuple[list[dict], list[dict], list[dict], Optional[torch.Tensor], Optional[int]]:
+) -> tuple[list[dict], list[dict], Optional[torch.Tensor], Optional[int]]:
     """Process embeddings and build multimodal items for SGLang.
 
     Returns:
-        Tuple of (image_mm_items, video_data_items, audio_data_items,
-        combined_embeddings, tensor_id).
+        Tuple of (image_mm_items, video_data_items, combined_embeddings, tensor_id).
     """
     image_mm_items: list[dict] = []
     video_data_items: list[dict] = []
-    audio_data_items: list[dict] = []
 
     encoded_groups: list[tuple[str, Any, int]] = []
 
@@ -277,10 +272,6 @@ async def _build_mm_items(
                 encoded_groups.append(
                     ("VIDEO", group.video_grid_thw, group.num_mm_tokens)
                 )
-            elif group.audio_feature_lens_raw is not None:
-                encoded_groups.append(
-                    ("AUDIO", group.audio_feature_lens_raw, group.num_mm_tokens)
-                )
             else:
                 raise ValueError("Encoded multimodal group missing grid metadata")
 
@@ -290,12 +281,8 @@ async def _build_mm_items(
     if encoded_groups:
         embeddings, tensor_id = await embeddings_processor.process_embeddings(request)
 
-        grouped_grids: dict[str, list[Any]] = {"IMAGE": [], "VIDEO": [], "AUDIO": []}
-        grouped_embeds: dict[str, list[torch.Tensor]] = {
-            "IMAGE": [],
-            "VIDEO": [],
-            "AUDIO": [],
-        }
+        grouped_grids: dict[str, list[Any]] = {"IMAGE": [], "VIDEO": []}
+        grouped_embeds: dict[str, list[torch.Tensor]] = {"IMAGE": [], "VIDEO": []}
 
         offset = 0
         for modality, grid_item, token_count in encoded_groups:
@@ -325,16 +312,8 @@ async def _build_mm_items(
                     modality="VIDEO",
                 )
             )
-        if grouped_embeds["AUDIO"]:
-            audio_data_items.append(
-                embeddings_processor.create_multimodal_item(
-                    torch.cat(grouped_embeds["AUDIO"], dim=0),
-                    grouped_grids["AUDIO"],
-                    modality="AUDIO",
-                )
-            )
 
-    return image_mm_items, video_data_items, audio_data_items, embeddings, tensor_id
+    return image_mm_items, video_data_items, embeddings, tensor_id
 
 
 class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
@@ -496,7 +475,6 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 (
                     image_mm_items,
                     video_data,
-                    audio_data,
                     combined_embeddings,
                     tensor_id,
                 ) = await _build_mm_items(request, self.embeddings_processor)
@@ -525,8 +503,6 @@ class MultimodalWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
                 gen_params["image_data"] = image_mm_items
             if video_data:
                 gen_params["video_data"] = video_data
-            if audio_data:
-                gen_params["audio_data"] = audio_data
 
             agg_stream = await self.engine.async_generate(**gen_params)
 
@@ -712,7 +688,6 @@ class MultimodalPrefillWorkerHandler(
             (
                 image_mm_items,
                 video_data,
-                audio_data,
                 _,
                 tensor_id,
             ) = await _build_mm_items(request, self.embeddings_processor)
@@ -738,8 +713,6 @@ class MultimodalPrefillWorkerHandler(
                 gen_params["image_data"] = image_mm_items
             if video_data:
                 gen_params["video_data"] = video_data
-            if audio_data:
-                gen_params["audio_data"] = audio_data
 
             results = await self.engine.async_generate(**gen_params)
 

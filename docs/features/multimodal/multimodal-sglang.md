@@ -12,8 +12,8 @@ This document provides a comprehensive guide for multimodal inference using SGLa
 |----------|--------------|------------|---------------|-------|
 | **Image** | HTTP/HTTPS URL | Yes | Yes | Vision encoder generates embeddings |
 | **Image** | Data URL (Base64) | No | No |  |
-| **Video** | HTTP/HTTPS/`file://` URL | Yes | No | Aggregated only |
-| **Audio** | HTTP/HTTPS URL | No | No |  |
+| **Video** | HTTP/HTTPS/`file://` URL | Yes | Yes | Vision encoder generates embeddings |
+| **Audio** | HTTP/HTTPS URL | No | No | Not supported in SGLang backend |
 
 ### Supported URL Formats
 

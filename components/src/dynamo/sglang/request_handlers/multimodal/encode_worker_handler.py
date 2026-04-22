@@ -53,7 +53,6 @@ except ImportError as e:
 
 IMAGE_URL_KEY = "image_url"
 VIDEO_URL_KEY = "video_url"
-AUDIO_URL_KEY = "audio_url"
 
 
 class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, str]):
@@ -114,9 +113,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         self.video_token_id: Optional[int] = self._resolve_mm_token_id(
             getattr(template, "video_token", None), preferred_token="<|video_pad|>"
         )
-        self.audio_token_id: Optional[int] = self._resolve_mm_token_id(
-            getattr(template, "audio_token", None), preferred_token="<|audio_pad|>"
-        )
 
         self.min_workers = 1
 
@@ -162,7 +158,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         if preferred_token:
             candidates.append(preferred_token)
 
-        for marker in ("<|image_pad|>", "<|video_pad|>", "<|audio_pad|>", "<|AUDIO|>"):
+        for marker in ("<|image_pad|>", "<|video_pad|>"):
             if marker in token_str and marker not in candidates:
                 candidates.append(marker)
 
@@ -179,12 +175,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             if not isinstance(grid_item, list) or len(grid_item) != 3:
                 raise ValueError(f"Invalid {modality.lower()} grid: {grid_item}")
             return int(grid_item[0] * grid_item[1] * grid_item[2])
-        if modality == "AUDIO":
-            if isinstance(grid_item, list):
-                if len(grid_item) != 1:
-                    raise ValueError(f"Invalid audio feature lens: {grid_item}")
-                return int(grid_item[0])
-            return int(grid_item)
         raise ValueError(f"Unsupported modality for grid units: {modality}")
 
     def _split_token_counts(
@@ -193,15 +183,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         """Compute per-item token counts for a modality from encoder grid metadata."""
         if total_tokens <= 0:
             raise ValueError("Invalid token count for embeddings")
-
-        if modality == "AUDIO":
-            if len(grid_list) == 1:
-                return [total_tokens]
-            # Audio tokenization is model-specific; for multiple audio items
-            # we currently require separate encoding to avoid ambiguous splitting.
-            raise ValueError(
-                "Multiple audio inputs are not supported in a single encoded batch"
-            )
 
         grid_sizes = [self._grid_units(item, modality) for item in grid_list]
         total_grid_tokens = sum(grid_sizes)
@@ -305,15 +286,15 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
 
     def _extract_media_urls(
         self, request: Dict[str, Any]
-    ) -> tuple[list[str], list[str], list[str]]:
+    ) -> tuple[list[str], list[str]]:
         """
-        Extract image/video/audio URLs from the multi_modal_data field of a PreprocessedRequest.
+        Extract image/video URLs from the multi_modal_data field of a PreprocessedRequest.
 
         The Rust frontend populates multi_modal_data with the format:
-            {"image_url": [{"Url": "https://..."}, ...], "video_url": [{"Url": "https://..."}, ...], "audio_url": [{"Url": "https://..."}, ...]}
+            {"image_url": [{"Url": "https://..."}, ...], "video_url": [{"Url": "https://..."}, ...]}
 
         Returns:
-            Tuple of (image_urls, video_urls, audio_urls) lists.
+            Tuple of (image_urls, video_urls) lists.
         """
         mm_data = request.get("multi_modal_data")
         if not mm_data:
@@ -321,16 +302,14 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
 
         image_items = mm_data.get(IMAGE_URL_KEY, [])
         video_items = mm_data.get(VIDEO_URL_KEY, [])
-        audio_items = mm_data.get(AUDIO_URL_KEY, [])
 
-        if not image_items and not video_items and not audio_items:
+        if not image_items and not video_items:
             raise ValueError(
-                "multi_modal_data must contain image_url, video_url, or audio_url entries."
+                "multi_modal_data must contain image_url or video_url entries."
             )
 
         image_urls: list[str] = []
         video_urls: list[str] = []
-        audio_urls: list[str] = []
 
         # Extract image URLs
         for item in image_items:
@@ -365,23 +344,7 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             else:
                 raise ValueError(f"Unsupported video data variant: {item}")
 
-        # Extract audio URLs
-        for item in audio_items:
-            if isinstance(item, str):
-                audio_urls.append(item)
-            elif isinstance(item, dict) and "Url" in item:
-                audio_urls.append(item["Url"])
-            elif isinstance(item, dict) and "Decoded" in item:
-                raise ValueError(
-                    "Frontend-decoded media (Decoded variant) is incompatible "
-                    "with the current SGLang EPD audio path. Audio inputs are "
-                    "URL-based in the encode worker. Disable --frontend-decoding "
-                    "or use URL-based audio_url inputs."
-                )
-            else:
-                raise ValueError(f"Unsupported audio data variant: {item}")
-
-        return image_urls, video_urls, audio_urls
+        return image_urls, video_urls
 
     @_nvtx.range_decorator("mm:enc:generate", color="blue")
     async def generate(
@@ -406,8 +369,8 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
         if isinstance(raw_request, str):
             raw_request = json.loads(raw_request)
 
-        # Extract image/video/audio URLs from the frontend's multi_modal_data
-        image_urls, video_urls, audio_urls = self._extract_media_urls(raw_request)
+        # Extract image/video URLs from the frontend's multi_modal_data
+        image_urls, video_urls = self._extract_media_urls(raw_request)
 
         # Build MultiModalGroup objects for the downstream SglangMultimodalRequest.
         multimodal_groups = (
@@ -418,10 +381,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
             + [
                 MultiModalGroup(multimodal_input=MultiModalInput(video_url=url))
                 for url in video_urls
-            ]
-            + [
-                MultiModalGroup(multimodal_input=MultiModalInput(audio_url=url))
-                for url in audio_urls
             ]
         )
         preprocessed_request = PreprocessedRequest.model_validate(raw_request)
@@ -454,14 +413,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
                     "video_grid_thw",
                     "video_url",
                 ),
-                (
-                    "AUDIO",
-                    audio_urls,
-                    Modality.AUDIO,
-                    self.audio_token_id,
-                    "audio_feature_lens_raw",
-                    "audio_url",
-                ),
             ]
 
             group_offset = 0
@@ -483,29 +434,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
                 with _nvtx.annotate("mm:enc:vision_encode", color="red"):
                     if modality_name == "IMAGE" and self._embedding_cache is not None:
                         grid_dim, embeddings = await self._encode_with_cache(urls)
-                    elif modality_name == "AUDIO" and len(urls) > 1:
-                        # Audio token lengths are model-specific; encode one-by-one
-                        # so we can store exact per-item token counts.
-                        audio_grids: list[Any] = []
-                        audio_embeds: list[torch.Tensor] = []
-                        for url in urls:
-                            grid_dim, emb, _aux = await mm_encode(
-                                self.encoder, [url], modality_enum
-                            )
-                            grid_list = (
-                                grid_dim.tolist()
-                                if isinstance(grid_dim, torch.Tensor)
-                                else grid_dim
-                            )
-                            grid_item = (
-                                grid_list[0]
-                                if isinstance(grid_list, list)
-                                else grid_list
-                            )
-                            audio_grids.append(grid_item)
-                            audio_embeds.append(emb)
-                        grid_dim = audio_grids
-                        embeddings = torch.cat(audio_embeds, dim=0)
                     else:
                         grid_dim, embeddings, _aux = await mm_encode(
                             self.encoder, urls, modality_enum
@@ -524,8 +452,6 @@ class MultimodalEncodeWorkerHandler(BaseWorkerHandler[SglangMultimodalRequest, s
                             and not isinstance(grid_list[0], list)
                         ):
                             grid_list = [grid_list]
-                    elif modality_name == "AUDIO" and not isinstance(grid_list, list):
-                        grid_list = [grid_list]
 
                 if not isinstance(grid_list, list) or len(grid_list) != len(urls):
                     raise ValueError(
